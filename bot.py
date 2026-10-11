@@ -460,7 +460,16 @@ async def prefetch_task(duration_sec, gen_id):
 
 async def start_walk(query, source="ytmusic", gen_id=0):
     global walk_state, pick_gen, walk_in_flight
-    if walk_in_flight: return
+    if walk_in_flight:
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if not walk_in_flight or pick_gen != gen_id:
+                break
+        if pick_gen != gen_id:
+            return
+        if walk_in_flight:
+            print(f"[WARN] start_walk: previous walk still in flight, bailing (query='{query}')", flush=True)
+            return
     walk_in_flight = True
     
     try:
@@ -556,6 +565,12 @@ async def start_walk(query, source="ytmusic", gen_id=0):
         if d_sec > 45:
             bot.loop.create_task(prefetch_task(d_sec, pick_gen))
             
+    except Exception as e:
+        print(f"[ERROR] start_walk failed for query='{query}': {e}", flush=True)
+        try:
+            await speak(f"Couldn't find {query}.")
+        except Exception:
+            pass
     finally:
         walk_in_flight = False
 
