@@ -826,7 +826,10 @@ async def transcribe_worker():
             if len(audio_bytes) < 16000 * 0.5 * 2: continue
             
             audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            t_whisper0 = time.time()
             text = await asyncio.to_thread(do_transcribe, audio_np)
+            t_emit = time.time()
+            print(f"[DEBUG-LATENCY] {user_id} | endpoint -> emit: {t_emit - t_end:.2f}s (whisper: {t_emit - t_whisper0:.2f}s)", flush=True)
             
             if text:
                 last_speech_time = time.time()
