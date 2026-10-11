@@ -670,7 +670,9 @@ async def announce_track_start(title, artist, url, video_id):
 async def handle_voice_command(text, user_id):
     global current_persona, pick_gen
     
-    clean = re.sub(r'^(hey\s+)?(echo|ecko|eco)[,\s]*', '', text, flags=re.IGNORECASE).strip()
+    wake_matches = list(re.finditer(r'(hey\s+)?(echo|ecko|eco)[,\s]*', text, flags=re.IGNORECASE))
+    wake_text = text[wake_matches[-1].end():] if wake_matches else text
+    clean = wake_text.strip()
     clean_norm = clean.strip(" .,!?:;'\"")
     
     channel = bot.get_channel(TEXT_CHANNEL_ID)
