@@ -836,8 +836,78 @@ async def re_roll_walk(gen_id=0):
                 if d_sec > 45:
                     bot.loop.create_task(prefetch_task(d_sec, pick_gen))
 
+async def fetch_lyrics(title: str, artist: str) -> str | None:
+    try:
+        cleaned_title = re.sub(
+            r'[\(\[][^\)\]]*(?:official|video|audio|lyric|visualizer|feat|ft\.|remaster|version)[^\)\]]*[\)\]]',
+            '',
+            title,
+            flags=re.IGNORECASE
+        ).strip(" -–—|")
+        if not cleaned_title:
+            cleaned_title = title.strip()
+
+        params = {
+            "track_name": cleaned_title,
+            "artist_name": artist
+        }
+        headers = {
+            "User-Agent": "ECHO-DJ/0.1 (local Discord bot)"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://lrclib.net/api/search",
+                params=params,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if not isinstance(data, list):
+                    return None
+                for entry in data:
+                    if not entry.get("instrumental", False):
+                        lyrics = entry.get("plainLyrics")
+                        if lyrics and lyrics.strip():
+                            return lyrics
+                return None
+    except Exception:
+        return None
+
+async def post_lyrics(title: str, artist: str):
+    try:
+        lyrics = await fetch_lyrics(title, artist)
+        if not lyrics:
+            print(f"[LYRICS] none found for {title} — {artist}", flush=True)
+            return
+
+        channel = bot.get_channel(TEXT_CHANNEL_ID)
+        if not channel:
+            return
+
+        desc = lyrics
+        if len(desc) > 4000:
+            target_limit = 4000 - 2
+            last_nl = desc.rfind("\n", 0, target_limit)
+            if last_nl != -1:
+                desc = desc[:last_nl].rstrip() + "\n…"
+            else:
+                desc = desc[:target_limit].rstrip() + "…"
+
+        embed = discord.Embed(
+            title=f"📜 Lyrics — {title} — {artist}",
+            description=desc,
+            color=discord.Color.blurple()
+        )
+        await channel.send(embed=embed)
+    except Exception as e:
+        if DEBUG: print(f"[DEBUG] post_lyrics error: {e}", flush=True)
+
 async def announce_track_start(title, artist, url, video_id):
     global current_persona, walk_state
+    
+    asyncio.create_task(post_lyrics(title, artist))
     
     playlist_name = walk_state.get("playlist_name") or "Curated"
     sentiment_line = await ask_llm_sentiment(title, artist, playlist_name)
