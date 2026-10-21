@@ -201,12 +201,14 @@ walk_state = {
     "index": 0,
     "tracks_played": 0,
     "max_tracks": 12,
-    "single_song": None
+    "single_song": None,
+    "explicit_playlist": None
 }
 pick_gen = 0
 walk_in_flight = False
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = discord.Bot(intents=intents)
 
 print(f"[DEBUG] Loading WhisperModel '{WHISPER_MODEL}'...")
@@ -451,6 +453,150 @@ async def fetch_soundcloud_tracks(playlist_url):
     except Exception as e:
         return "SoundCloud Playlist", []
 
+async def fetch_youtube_dlp_tracks(playlist_url):
+    try:
+        cmd = ["yt-dlp", "--flat-playlist", "-J", playlist_url]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await proc.communicate()
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+        tracks = []
+        for e in data.get("entries", []):
+            vid = e.get("id")
+            title = e.get("title")
+            if vid and title:
+                tracks.append({
+                    "title": title,
+                    "artist": e.get("uploader", "Unknown"),
+                    "video_id": vid,
+                    "url": f"https://youtube.com/watch?v={vid}",
+                    "duration": e.get("duration")
+                })
+        title = data.get("title") or "YouTube Playlist"
+        return title, tracks
+    except Exception as e:
+        if DEBUG: print(f"[DEBUG] Error running yt-dlp for playlist {playlist_url}: {e}")
+        return "YouTube Playlist", []
+
+async def resolve_direct_playlist(url: str):
+    if not url:
+        return None
+    url_clean = url.strip().strip('<>')
+    parsed = urllib.parse.urlparse(url_clean)
+    domain = parsed.netloc.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    if domain.startswith("m."):
+        domain = domain[2:]
+
+    if domain == "soundcloud.com":
+        if "/sets/" not in parsed.path:
+            return None
+        title, tracks = await fetch_soundcloud_tracks(url_clean)
+        clean_title = title if (title and title not in ("SoundCloud Playlist",)) else (title or "")
+        return {
+            "source": "soundcloud",
+            "ref": url_clean,
+            "title": clean_title,
+            "tracks": tracks,
+            "start_index": None
+        }
+
+    if domain in ("youtube.com", "music.youtube.com"):
+        qs = urllib.parse.parse_qs(parsed.query)
+        pids = qs.get("list")
+        if not pids or not pids[0]:
+            return None
+        playlist_id = pids[0]
+        video_id = qs.get("v", [None])[0]
+
+        title, tracks = await fetch_playlist_tracks(playlist_id)
+        if not tracks:
+            title, tracks = await fetch_youtube_dlp_tracks(url_clean)
+
+        start_index = None
+        if video_id and tracks:
+            for idx, t in enumerate(tracks):
+                if t.get("video_id") == video_id:
+                    start_index = idx
+                    break
+
+        clean_title = title if (title and title not in ("Playlist", "YouTube Music Playlist", "YouTube Playlist")) else (title or "")
+        return {
+            "source": "ytmusic",
+            "ref": playlist_id,
+            "title": clean_title,
+            "tracks": tracks,
+            "start_index": start_index
+        }
+
+    return None
+
+def detect_playlist_url(text: str):
+    if not text:
+        return None
+    urls = re.findall(r'https?://[^\s<>"]+', text)
+    for u in urls:
+        u_clean = u.strip().strip('<>')
+        try:
+            parsed = urllib.parse.urlparse(u_clean)
+            domain = parsed.netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if domain.startswith("m."):
+                domain = domain[2:]
+            if domain in ("youtube.com", "music.youtube.com"):
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "list" in qs and qs["list"] and qs["list"][0]:
+                    return u_clean
+            elif domain == "soundcloud.com":
+                if "/sets/" in parsed.path:
+                    return u_clean
+        except:
+            continue
+    return None
+
+async def handle_direct_playlist(url: str, ctx=None, channel=None):
+    if ctx:
+        await ctx.defer()
+    target_channel = channel or (ctx.channel if ctx else bot.get_channel(TEXT_CHANNEL_ID))
+
+    res = await resolve_direct_playlist(url)
+    if not res or not res.get("tracks"):
+        await speak("couldn't load that playlist.")
+        fail_msg = "❌ couldn't load that playlist."
+        if ctx:
+            await ctx.followup.send(fail_msg)
+        elif target_channel:
+            await target_channel.send(fail_msg)
+        return
+
+    title = res.get("title", "")
+    tracks = res.get("tracks", [])
+    source = res.get("source", "ytmusic")
+    ref = res.get("ref", "")
+    start_index = res.get("start_index")
+
+    ack_text = f"On it — {title}." if title else "On it."
+    asyncio.create_task(speak(ack_text))
+
+    send_msg = f"🎧 On it — **{title}**" if title else "🎧 On it."
+    if ctx:
+        await ctx.followup.send(send_msg)
+    elif target_channel:
+        await target_channel.send(send_msg)
+
+    global pick_gen
+    pick_gen += 1
+    explicit_playlist = {"source": source, "ref": ref, "title": title}
+    asyncio.create_task(start_walk(
+        query="",
+        source=source,
+        gen_id=pick_gen,
+        explicit_playlist=explicit_playlist,
+        initial_start_index=start_index,
+        prefetched_tracks=tracks
+    ))
+
 # Walk Engine
 async def prefetch_task(duration_sec, gen_id):
     global pick_gen
@@ -458,7 +604,7 @@ async def prefetch_task(duration_sec, gen_id):
     if pick_gen == gen_id:
         await advance_walk(trigger="prefetch", gen_id=pick_gen)
 
-async def start_walk(query, source="ytmusic", gen_id=0):
+async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=None, initial_start_index=None, prefetched_tracks=None):
     global walk_state, pick_gen, walk_in_flight
     if walk_in_flight:
         for _ in range(60):
@@ -473,71 +619,107 @@ async def start_walk(query, source="ytmusic", gen_id=0):
     walk_in_flight = True
     
     try:
-        chosen_playlist = None
-        candidates = []
-        
-        if source == "soundcloud":
-            candidates = await resolve_playlist_soundcloud(query)
-        else:
-            candidates = await resolve_playlist_ytmusic(query)
-            
-        if len(candidates) >= 3:
-            chosen = random.choice(candidates[:3])
-            chosen_playlist = chosen
-        
         tracks = []
         playlist_title = ""
-        
-        if chosen_playlist:
-            if source == "soundcloud":
-                playlist_title, tracks = await fetch_soundcloud_tracks(chosen_playlist["url"])
-            else:
-                playlist_title, tracks = await fetch_playlist_tracks(chosen_playlist["id"])
-                
-        # 5c. If fewer than 3 usable playlists: fall back to SONG search
-        if not tracks or len(candidates) < 3:
-            song = await search_single_song(query, source=source)
-            if song:
-                if pick_gen != gen_id: return
-                walk_state = {
-                    "query": query,
-                    "source": source,
-                    "playlist_name": "Direct Search",
-                    "tracks": [song],
-                    "index": 0,
-                    "tracks_played": 1,
-                    "max_tracks": 1,
-                    "single_song": song
-                }
-                await send_bridge_cmd({"cmd": "stop"})
-                await send_bridge_cmd({"cmd": "queue", "url": song["url"], "title": song["title"], "artist": song["artist"]})
-                log_pick("echo", query, source, "Direct Search", song["title"], song["artist"], song.get("video_id"))
-                d_sec = parse_duration_seconds(song.get("duration", 180))
-                if d_sec > 45:
-                    bot.loop.create_task(prefetch_task(d_sec, pick_gen))
-                return
-            else:
-                # 5d. Song search also fails: TTS "couldn't find <query>" and keep current walk
-                await speak(f"Couldn't find {query}.")
-                channel = bot.get_channel(TEXT_CHANNEL_ID)
-                if channel: await channel.send(f"❌ Couldn't find {query}.")
-                return
 
-        # 6a. Start at a RANDOM offset (never track 1 when tracks > 1)
-        if len(tracks) > 1:
+        if explicit_playlist:
+            source = explicit_playlist.get("source", source)
+            ref = explicit_playlist.get("ref", "")
+            playlist_title = explicit_playlist.get("title", "")
+            
+            tracks = prefetched_tracks or []
+            if not tracks:
+                if source == "soundcloud":
+                    t_title, tracks = await fetch_soundcloud_tracks(ref)
+                    if t_title and t_title not in ("SoundCloud Playlist",):
+                        playlist_title = t_title
+                    elif not playlist_title:
+                        playlist_title = t_title
+                else:
+                    t_title, tracks = await fetch_playlist_tracks(ref)
+                    if not tracks:
+                        playlist_url = f"https://www.youtube.com/playlist?list={ref}" if not ref.startswith("http") else ref
+                        t_title, tracks = await fetch_youtube_dlp_tracks(playlist_url)
+                    if t_title and t_title not in ("Playlist", "YouTube Music Playlist", "YouTube Playlist"):
+                        playlist_title = t_title
+                    elif not playlist_title:
+                        playlist_title = t_title
+
+            if not tracks:
+                if pick_gen != gen_id: return
+                await speak("couldn't load that playlist.")
+                channel = bot.get_channel(TEXT_CHANNEL_ID)
+                if channel: await channel.send("❌ couldn't load that playlist.")
+                return
+        else:
+            chosen_playlist = None
+            candidates = []
+            
+            if source == "soundcloud":
+                candidates = await resolve_playlist_soundcloud(query)
+            else:
+                candidates = await resolve_playlist_ytmusic(query)
+                
+            if len(candidates) >= 3:
+                chosen = random.choice(candidates[:3])
+                chosen_playlist = chosen
+            
+            if chosen_playlist:
+                if source == "soundcloud":
+                    playlist_title, tracks = await fetch_soundcloud_tracks(chosen_playlist["url"])
+                else:
+                    playlist_title, tracks = await fetch_playlist_tracks(chosen_playlist["id"])
+                    
+            # 5c. If fewer than 3 usable playlists: fall back to SONG search
+            if not tracks or len(candidates) < 3:
+                song = await search_single_song(query, source=source)
+                if song:
+                    if pick_gen != gen_id: return
+                    walk_state = {
+                        "query": query,
+                        "source": source,
+                        "playlist_name": "Direct Search",
+                        "tracks": [song],
+                        "index": 0,
+                        "tracks_played": 1,
+                        "max_tracks": 1,
+                        "single_song": song,
+                        "explicit_playlist": None
+                    }
+                    await send_bridge_cmd({"cmd": "stop"})
+                    await send_bridge_cmd({"cmd": "queue", "url": song["url"], "title": song["title"], "artist": song["artist"]})
+                    log_pick("echo", query, source, "Direct Search", song["title"], song["artist"], song.get("video_id"))
+                    d_sec = parse_duration_seconds(song.get("duration", 180))
+                    if d_sec > 45:
+                        bot.loop.create_task(prefetch_task(d_sec, pick_gen))
+                    return
+                else:
+                    # 5d. Song search also fails: TTS "couldn't find <query>" and keep current walk
+                    await speak(f"Couldn't find {query}.")
+                    channel = bot.get_channel(TEXT_CHANNEL_ID)
+                    if channel: await channel.send(f"❌ Couldn't find {query}.")
+                    return
+
+        # 6a. Start at a RANDOM offset (never track 1 when tracks > 1, unless explicit with initial_start_index)
+        if explicit_playlist and initial_start_index is not None and 0 <= initial_start_index < len(tracks):
+            start_offset = initial_start_index
+        elif len(tracks) > 1:
             start_offset = random.randint(1, len(tracks) - 1)
         else:
             start_offset = 0
 
+        final_playlist_name = playlist_title or (explicit_playlist.get("title") if explicit_playlist else "") or query.title()
+
         walk_state = {
             "query": query,
             "source": source,
-            "playlist_name": playlist_title or query.title(),
+            "playlist_name": final_playlist_name,
             "tracks": tracks,
             "index": start_offset,
             "tracks_played": 0,
             "max_tracks": random.randint(10, 15),
-            "single_song": None
+            "single_song": None,
+            "explicit_playlist": explicit_playlist
         }
         
         # 6c. DEDUP: check video ID against recent_played_vids
@@ -559,16 +741,21 @@ async def start_walk(query, source="ytmusic", gen_id=0):
         # Stop old playback and queue new track immediately
         await send_bridge_cmd({"cmd": "stop"})
         await send_bridge_cmd({"cmd": "queue", "url": track["url"], "title": track["title"], "artist": track["artist"]})
-        log_pick("echo", query, source, walk_state["playlist_name"], track["title"], track["artist"], track.get("video_id"))
+        log_pick("echo", query or final_playlist_name, source, walk_state["playlist_name"], track["title"], track["artist"], track.get("video_id"))
         
         d_sec = parse_duration_seconds(track.get("duration"))
         if d_sec > 45:
             bot.loop.create_task(prefetch_task(d_sec, pick_gen))
             
     except Exception as e:
-        print(f"[ERROR] start_walk failed for query='{query}': {e}", flush=True)
+        print(f"[ERROR] start_walk failed: {e}", flush=True)
         try:
-            await speak(f"Couldn't find {query}.")
+            if explicit_playlist:
+                await speak("couldn't load that playlist.")
+                channel = bot.get_channel(TEXT_CHANNEL_ID)
+                if channel: await channel.send("❌ couldn't load that playlist.")
+            else:
+                await speak(f"Couldn't find {query}.")
         except Exception:
             pass
     finally:
@@ -615,6 +802,11 @@ async def re_roll_walk(gen_id=0):
     global walk_state, pick_gen
     if pick_gen != gen_id: return
     
+    explicit = walk_state.get("explicit_playlist")
+    if explicit:
+        await start_walk(query="", source=explicit.get("source", "ytmusic"), gen_id=gen_id, explicit_playlist=explicit)
+        return
+
     query = walk_state.get("query")
     source = walk_state.get("source", "ytmusic")
     
@@ -634,7 +826,8 @@ async def re_roll_walk(gen_id=0):
                     "index": offset,
                     "tracks_played": 0,
                     "max_tracks": random.randint(10, 15),
-                    "single_song": None
+                    "single_song": None,
+                    "explicit_playlist": None
                 }
                 track = tracks[offset]
                 await send_bridge_cmd({"cmd": "queue", "url": track["url"], "title": track["title"], "artist": track["artist"]})
@@ -1030,6 +1223,20 @@ async def status(ctx):
     else:
         msg += "**Now Playing:** None\n**Queue:** Empty"
     await ctx.followup.send(msg)
+
+@bot.slash_command(name="playlist", description="Play a direct playlist from YouTube or SoundCloud")
+async def playlist_cmd(ctx, url: str):
+    await handle_direct_playlist(url, ctx=ctx)
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user or message.author.bot:
+        return
+    if message.channel.id != TEXT_CHANNEL_ID:
+        return
+    url = detect_playlist_url(message.content)
+    if url:
+        await handle_direct_playlist(url, channel=message.channel)
 
 @bot.event
 async def on_ready():
