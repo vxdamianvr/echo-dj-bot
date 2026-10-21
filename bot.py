@@ -282,7 +282,7 @@ async def ask_llm(prompt, model=None, format=None):
                     "options": {"temperature": 0.7}
                 }
                 if format: payload["format"] = format
-                async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         return data.get("response")
@@ -320,7 +320,7 @@ React to the room and the music with ONE single punchy line in your persona. Do 
                 "keep_alive": "30m",
                 "options": {"temperature": 0.8}
             }
-            async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     response_text = data.get("response", "").strip()
