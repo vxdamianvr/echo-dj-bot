@@ -219,6 +219,29 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Bot(intents=intents)
 
+async def get_text_channel():
+    if not TEXT_CHANNEL_ID:
+        return None
+    channel = bot.get_channel(TEXT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(TEXT_CHANNEL_ID)
+        except Exception as e:
+            if DEBUG: print(f"[DEBUG] fetch_channel failed: {e}", flush=True)
+            channel = None
+    return channel
+
+last_picker_message = None
+
+async def retire_picker_message():
+    global last_picker_message
+    if last_picker_message is not None:
+        try:
+            await last_picker_message.edit(view=None)
+        except Exception:
+            pass
+        last_picker_message = None
+
 stt_model = None
 
 def get_stt_model():
@@ -1049,18 +1072,23 @@ async def fetch_lyrics(title: str, artist: str) -> str | None:
     except Exception:
         return None
 
-async def post_lyrics(title: str, artist: str):
+async def post_lyrics(title: str, artist: str, thread=None):
     try:
         lyrics = await fetch_lyrics(title, artist)
         if not lyrics:
             print(f"[LYRICS] none found for {title} — {artist}", flush=True)
-            channel = bot.get_channel(TEXT_CHANNEL_ID)
+            if thread:
+                try:
+                    await thread.delete()
+                except Exception as e:
+                    if DEBUG: print(f"[DEBUG] lyrics thread delete failed: {e}", flush=True)
+            channel = await get_text_channel()
             if channel:
                 await channel.send(f"🎵 Couldn't find lyrics for {title}.")
             return
 
-        channel = bot.get_channel(TEXT_CHANNEL_ID)
-        if not channel:
+        channel = await get_text_channel()
+        if not thread and not channel:
             return
 
         desc = lyrics
@@ -1077,22 +1105,49 @@ async def post_lyrics(title: str, artist: str):
             description=desc,
             color=discord.Color.blurple()
         )
-        await channel.send(embed=embed)
+        if thread:
+            try:
+                await thread.send(embed=embed)
+                return
+            except Exception as te:
+                if DEBUG: print(f"[DEBUG] post_lyrics thread send failed, falling back to channel: {te}", flush=True)
+
+        if channel:
+            await channel.send(embed=embed)
     except Exception as e:
         if DEBUG: print(f"[DEBUG] post_lyrics error: {e}", flush=True)
 
-async def _append_sentiment(message, base_desc, title, artist, playlist_name):
+async def _append_sentiment(message, base_desc, title, artist, playlist_name, video_id=None):
     # Runs independently of the now-playing embed; failures here never affect it.
     try:
+        t0 = time.time()
         sentiment_line = await ask_llm_sentiment(title, artist, playlist_name)
-        print(f"[{current_persona.upper()}] {sentiment_line}", flush=True)
-        if message is None or not sentiment_line:
+        elapsed = time.time() - t0
+        print(f"[{current_persona.upper()}] sentiment generated in {elapsed:.2f}s: {sentiment_line}", flush=True)
+
+        if message is None:
+            print(f"[SENTIMENT] [{title}] message is None, skipping edit.", flush=True)
             return
+        if not sentiment_line:
+            print(f"[SENTIMENT] [{title}] no sentiment generated, skipping edit.", flush=True)
+            return
+
+        msg_id = getattr(message, "id", None)
+        print(f"[SENTIMENT] [{title}] editing message id={msg_id}...", flush=True)
+
         embed = discord.Embed(color=discord.Color.blurple())
         embed.description = f"{base_desc}\n{sentiment_line}"
+        if video_id:
+            embed.set_thumbnail(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+        elif getattr(message, "embeds", None) and message.embeds[0].thumbnail and message.embeds[0].thumbnail.url:
+            embed.set_thumbnail(url=message.embeds[0].thumbnail.url)
+
         await message.edit(embed=embed)
+        print(f"[SENTIMENT] [{title}] message id={msg_id} edit SUCCESS: sentiment appended.", flush=True)
     except Exception as e:
-        if DEBUG: print(f"[DEBUG] sentiment append failed: {e}", flush=True)
+        msg_id = getattr(message, "id", None) if message else None
+        print(f"[SENTIMENT] [{title}] message id={msg_id} edit FAILED: {e}", flush=True)
+        traceback.print_exc()
 
 async def announce_track_start(title, artist, url, video_id):
     global current_persona, walk_state
@@ -1111,18 +1166,28 @@ async def announce_track_start(title, artist, url, video_id):
     
     # Now-playing embed is time-critical: send it first, before any LLM work.
     message = None
-    channel = bot.get_channel(TEXT_CHANNEL_ID)
+    channel = await get_text_channel()
     if channel:
         try:
             embed = discord.Embed(color=discord.Color.blurple())
             embed.description = base_desc
+            if video_id:
+                embed.set_thumbnail(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
             message = await channel.send(embed=embed)
         except Exception as e:
             if DEBUG: print(f"[DEBUG] now-playing embed send failed: {e}", flush=True)
     
-    asyncio.create_task(post_lyrics(title, artist))
+    thread = None
+    if message:
+        try:
+            thread = await message.create_thread(name=f"Lyrics: {title}"[:90], auto_archive_duration=60)
+        except Exception as e:
+            if DEBUG: print(f"[DEBUG] lyrics create_thread failed: {e}", flush=True)
+            thread = None
+
+    asyncio.create_task(post_lyrics(title, artist, thread=thread))
     # One-liner arrives later via edit; never blocks or prevents the embed.
-    asyncio.create_task(_append_sentiment(message, base_desc, title, artist, playlist_name))
+    asyncio.create_task(_append_sentiment(message, base_desc, title, artist, playlist_name, video_id=video_id))
 
 async def handle_back_command(channel=None, ctx=None):
     global walk_state, pick_gen, playback_intent
@@ -1483,10 +1548,30 @@ class PersonaSelect(discord.ui.Select):
         super().__init__(custom_id="echo_persona_select", placeholder="Choose Echo's persona...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        global current_persona
+        global current_persona, last_picker_message
+        if not self.values:
+            return
         current_persona = self.values[0]
+        name = current_persona.capitalize()
         print(f"[PERSONA] switched to {current_persona}", flush=True)
-        await interaction.response.edit_message(content=f"Persona locked in: **{current_persona.capitalize()}** — change anytime:", view=self.view)
+        await interaction.response.edit_message(content=f"Persona locked in: **{name}**.", view=None)
+
+        if last_picker_message and last_picker_message.id != interaction.message.id:
+            try:
+                await last_picker_message.edit(view=None)
+            except Exception:
+                pass
+            last_picker_message = None
+
+        channel = await get_text_channel()
+        if channel is None:
+            channel = interaction.channel
+        if channel:
+            try:
+                new_msg = await channel.send(f"Persona switched to: **{name}** — want to change again?", view=PersonaView())
+                last_picker_message = new_msg
+            except Exception as e:
+                print(f"[PERSONA] failed to send new picker: {e}", flush=True)
 
 class PersonaView(discord.ui.View):
     def __init__(self):
@@ -1498,13 +1583,18 @@ class PersonaView(discord.ui.View):
 async def join(ctx=None):
     if ctx:
         await ctx.defer()
-    global bridge_process, bridge_server, bridge_active, intentional_leave, pick_gen, playback_intent
+    global bridge_process, bridge_server, bridge_active, intentional_leave, pick_gen, playback_intent, last_picker_message
     intentional_leave = False
     playback_intent = "playing"
-    channel = bot.get_channel(TEXT_CHANNEL_ID)
+    channel = await get_text_channel()
     if bridge_active:
-        if ctx: return await ctx.followup.send("Already joined and listening via Node bridge! 🎧", view=PersonaView())
-        elif channel: return await channel.send("Already joined and listening via Node bridge! 🎧", view=PersonaView())
+        msg = "Already joined and listening via Node bridge! 🎧"
+        if ctx:
+            last_picker_message = await ctx.followup.send(msg, view=PersonaView())
+            return last_picker_message
+        elif channel:
+            last_picker_message = await channel.send(msg, view=PersonaView())
+            return last_picker_message
         return
     if not bridge_server:
         bridge_server = await asyncio.start_server(handle_bridge_client, '127.0.0.1', BRIDGE_PORT)
@@ -1519,8 +1609,10 @@ async def join(ctx=None):
     try:
         await asyncio.wait_for(bridge_connected_event.wait(), timeout=15.0)
         msg = "Joined and listening via Node bridge! 🎧 Pick a persona:"
-        if ctx: await ctx.followup.send(msg, view=PersonaView())
-        elif channel: await channel.send(msg, view=PersonaView())
+        if ctx:
+            last_picker_message = await ctx.followup.send(msg, view=PersonaView())
+        elif channel:
+            last_picker_message = await channel.send(msg, view=PersonaView())
         asyncio.create_task(warmup_ollama())
         if JOIN_AUTOPLAY:
             pick_gen += 1
@@ -1586,7 +1678,11 @@ async def stop(ctx):
 
 @bot.slash_command(name="persona", description="Switch Echo's personality")
 async def persona_cmd(ctx):
-    await ctx.respond("Choose Echo's persona:", view=PersonaView())
+    global last_picker_message
+    await ctx.defer()
+    await retire_picker_message()
+    msg = await ctx.followup.send("Choose Echo's persona:", view=PersonaView())
+    last_picker_message = msg
 
 @bot.slash_command(name="queue", description="Show current queue and now playing")
 async def queue(ctx):
