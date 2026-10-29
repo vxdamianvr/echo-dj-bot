@@ -1480,12 +1480,13 @@ class PersonaSelect(discord.ui.Select):
             discord.SelectOption(label="Velvet", value="velvet", description="Deadpan late-night host, quietly unimpressed", emoji="🍸"),
             discord.SelectOption(label="Hype", value="hype", description="Catastrophically over-excited hype-man", emoji="🔥"),
         ]
-        super().__init__(placeholder="Choose Echo's persona...", min_values=1, max_values=1, options=options)
+        super().__init__(custom_id="echo_persona_select", placeholder="Choose Echo's persona...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         global current_persona
         current_persona = self.values[0]
-        await interaction.response.edit_message(content=f"Persona locked in: **{current_persona.capitalize()}** 🔒", view=None)
+        print(f"[PERSONA] switched to {current_persona}", flush=True)
+        await interaction.response.edit_message(content=f"Persona locked in: **{current_persona.capitalize()}** — change anytime:", view=self.view)
 
 class PersonaView(discord.ui.View):
     def __init__(self):
@@ -1503,7 +1504,7 @@ async def join(ctx=None):
     channel = bot.get_channel(TEXT_CHANNEL_ID)
     if bridge_active:
         if ctx: return await ctx.followup.send("Already joined and listening via Node bridge! 🎧", view=PersonaView())
-        elif channel: return await channel.send("Already joined and listening via Node bridge! 🎧")
+        elif channel: return await channel.send("Already joined and listening via Node bridge! 🎧", view=PersonaView())
         return
     if not bridge_server:
         bridge_server = await asyncio.start_server(handle_bridge_client, '127.0.0.1', BRIDGE_PORT)
@@ -1519,7 +1520,7 @@ async def join(ctx=None):
         await asyncio.wait_for(bridge_connected_event.wait(), timeout=15.0)
         msg = "Joined and listening via Node bridge! 🎧 Pick a persona:"
         if ctx: await ctx.followup.send(msg, view=PersonaView())
-        elif channel: await channel.send(msg)
+        elif channel: await channel.send(msg, view=PersonaView())
         asyncio.create_task(warmup_ollama())
         if JOIN_AUTOPLAY:
             pick_gen += 1
@@ -1674,6 +1675,7 @@ async def command_file_watcher():
 async def on_ready():
     print(f"Logged in as {bot.user}")
     
+    bot.add_view(PersonaView())
     print("[DEBUG] Warming up Ollama...")
     bot.loop.create_task(warmup_ollama())
     get_stt_model()
