@@ -79,10 +79,10 @@ function prefetchNext() {
     });
 }
 
-function playNext(lastDuration = 0) {
+function playNext(wasCommand = false, lastDuration = 0) {
     if (audioQueue.length === 0) {
         currentTrack = null;
-        if (!hasEmittedQueueEmpty) {
+        if (!hasEmittedQueueEmpty && !wasCommand) {
             hasEmittedQueueEmpty = true;
             if (DEBUG) console.log(`[DEBUG] Queue empty, emitting queue_empty event. Last duration: ${lastDuration}s`);
             tcpClient.write(JSON.stringify({ event: 'queue_empty', last_duration: lastDuration, player: 'idle' }) + '\n');
@@ -99,7 +99,9 @@ function playNext(lastDuration = 0) {
     if (audioQueue.length === 0) {
         hasEmittedQueueEmpty = true;
         if (DEBUG) console.log(`[DEBUG] Queue empty after shift, emitting early queue_empty event`);
-        tcpClient.write(JSON.stringify({ event: 'queue_empty', last_duration: 0, player: 'playing' }) + '\n');
+        if (!wasCommand) {
+            tcpClient.write(JSON.stringify({ event: 'queue_empty', last_duration: 0, player: 'playing' }) + '\n');
+        }
     } else {
         hasEmittedQueueEmpty = false;
     }
@@ -129,7 +131,13 @@ function startLocalPlayback(filePath) {
     try {
         const resource = createAudioResource(filePath);
         if (currentTrack) {
-            tcpClient.write(JSON.stringify({ event: 'track_start', title: currentTrack.title, artist: currentTrack.artist }) + '\n');
+            tcpClient.write(JSON.stringify({
+                event: 'track_start',
+                title: currentTrack.title,
+                artist: currentTrack.artist,
+                url: currentTrack.url || '',
+                video_id: currentTrack.video_id || null
+            }) + '\n');
         }
         player.play(resource);
     } catch (err) {
@@ -141,6 +149,7 @@ function startLocalPlayback(filePath) {
 
 player.on(AudioPlayerStatus.Idle, () => {
     const playDuration = (Date.now() - trackStartTime) / 1000;
+    const wasCommand = isCommandTransition;
     
     if (DEBUG) console.log(`[DEBUG] AudioPlayer transitioned to Idle. Played for ${playDuration.toFixed(2)}s. isCommandTransition: ${isCommandTransition}`);
     
@@ -169,7 +178,7 @@ player.on(AudioPlayerStatus.Idle, () => {
         try { fs.unlinkSync(currentTrack.localFile); } catch(e) {}
     }
 
-    playNext(playDuration);
+    playNext(wasCommand, playDuration);
 });
 
 player.on('error', (error) => {
@@ -240,7 +249,7 @@ tcpClient.on('data', (chunk) => {
                 }
                 
                 if (DEBUG) console.log(`[DEBUG] Received queue cmd: ${msg.title}`);
-                audioQueue.push({ url: msg.url, title: msg.title, artist: msg.artist });
+                audioQueue.push({ url: msg.url, title: msg.title, artist: msg.artist, video_id: msg.video_id || null });
                 
                 if (player.state.status === AudioPlayerStatus.Idle) {
                     playNext(0);

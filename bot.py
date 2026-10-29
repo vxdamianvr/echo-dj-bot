@@ -1,10 +1,18 @@
 import os
+import sys
 import json
 import time
 import asyncio
 import subprocess
 import traceback
 import logging
+
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 import numpy as np
 import webrtcvad
 import aiohttp
@@ -219,43 +227,145 @@ utterance_queue = asyncio.Queue()
 transcript_history = []
 last_speech_time = time.time()
 
+# Playback intent
+playback_intent = "playing"
+
 # Bridge variables
 bridge_process = None
 bridge_server = None
 bridge_active = False
 bridge_connected_event = asyncio.Event()
+bridge_reconnecting = False
 user_buffers = {}
 intentional_leave = False
 bridge_writer = None
 bridge_futures = {}
 
-async def send_bridge_cmd(cmd_dict, wait_for_reply=False):
-    if bridge_writer and bridge_active:
-        try:
-            req_id = str(uuid.uuid4())
-            cmd_dict["uuid"] = req_id
-            fut = None
-            if wait_for_reply:
-                fut = asyncio.Future()
-                bridge_futures[req_id] = fut
+def spawn_bridge():
+    global bridge_process
+    os.makedirs("logs", exist_ok=True)
+    stderr_file = open("logs/bridge-stderr.log", "a", encoding="utf-8")
+    bridge_process = subprocess.Popen(
+        ["node", "voice-bridge/bridge.js"],
+        cwd=os.getcwd(),
+        stderr=stderr_file
+    )
 
-            msg = json.dumps(cmd_dict) + "\n"
-            bridge_writer.write(msg.encode())
-            await bridge_writer.drain()
+async def resume_walk_after_reconnect():
+    tracks = walk_state.get("tracks", [])
+    if not tracks:
+        return
+    idx = walk_state.get("index", 0)
+    if 0 <= idx < len(tracks):
+        track = tracks[idx]
+        print(f"[SUPERVISOR] Resuming walk from last confirmed track [{idx+1}/{len(tracks)}]: {track.get('title')}", flush=True)
+        await send_bridge_cmd({
+            "cmd": "queue",
+            "url": track["url"],
+            "title": track["title"],
+            "artist": track["artist"],
+            "video_id": track.get("video_id")
+        })
+
+async def reconnect_bridge_supervisor():
+    global bridge_reconnecting, bridge_process, bridge_active, bridge_server
+    if bridge_reconnecting or intentional_leave:
+        return
+    bridge_reconnecting = True
+    
+    channel = bot.get_channel(TEXT_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send("Voice bridge dropped — reconnecting…")
+        except Exception:
+            pass
+
+    backoffs = [5, 15, 30]
+    reconnected = False
+    
+    for delay in backoffs:
+        if intentional_leave:
+            break
+        print(f"[SUPERVISOR] Bridge disconnected. Waiting {delay}s before reconnect attempt...", flush=True)
+        await asyncio.sleep(delay)
+        if intentional_leave:
+            break
             
-            if wait_for_reply:
+        bridge_connected_event.clear()
+        if bridge_process:
+            try:
+                bridge_process.terminate()
+            except Exception:
+                pass
+            bridge_process = None
+            
+        print("[SUPERVISOR] Spawning node bridge...", flush=True)
+        try:
+            if not bridge_server:
+                bridge_server = await asyncio.start_server(handle_bridge_client, '127.0.0.1', BRIDGE_PORT)
+            spawn_bridge()
+            await asyncio.wait_for(bridge_connected_event.wait(), timeout=15.0)
+            reconnected = True
+            print("[SUPERVISOR] Bridge reconnected successfully!", flush=True)
+            if channel:
                 try:
-                    res = await asyncio.wait_for(fut, timeout=3.0)
-                    return res
-                except asyncio.TimeoutError:
-                    return None
-                finally:
-                    bridge_futures.pop(req_id, None)
-            return None
+                    await channel.send("🟢 Voice bridge reconnected.")
+                except Exception:
+                    pass
+            break
         except Exception as e:
-            print("[CRITICAL] Failed to send bridge cmd:", e)
-            return None
-    return None
+            print(f"[SUPERVISOR] Reconnect attempt failed: {e}", flush=True)
+            
+    if not reconnected and not intentional_leave:
+        print("[SUPERVISOR] All bridge reconnect attempts exhausted.", flush=True)
+        if channel:
+            try:
+                await channel.send("Voice bridge down.")
+            except Exception:
+                pass
+                
+    bridge_reconnecting = False
+    
+    if reconnected and playback_intent == "playing":
+        await resume_walk_after_reconnect()
+
+async def send_bridge_cmd(cmd_dict, wait_for_reply=False):
+    if not bridge_writer or not bridge_active:
+        cmd_name = cmd_dict.get("cmd", "unknown")
+        print(f"[WARNING] send_bridge_cmd failed: Bridge is unreachable! Dropped command: {cmd_name}", flush=True)
+        if cmd_name in ("queue", "play"):
+            channel = bot.get_channel(TEXT_CHANNEL_ID)
+            if channel:
+                try:
+                    await channel.send("Voice bridge is down — command not queued.")
+                except Exception:
+                    pass
+        return None
+
+    try:
+        req_id = str(uuid.uuid4())
+        cmd_dict["uuid"] = req_id
+        fut = None
+        if wait_for_reply:
+            fut = asyncio.Future()
+            bridge_futures[req_id] = fut
+
+        msg = json.dumps(cmd_dict) + "\n"
+        bridge_writer.write(msg.encode())
+        await bridge_writer.drain()
+        
+        if wait_for_reply:
+            try:
+                res = await asyncio.wait_for(fut, timeout=3.0)
+                return res
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                bridge_futures.pop(req_id, None)
+        return None
+    except Exception as e:
+        print("[CRITICAL] Failed to send bridge cmd:", e)
+        return None
 
 async def speak(text):
     if not TTS_ENABLED or not kokoro: return
@@ -271,6 +381,7 @@ async def speak(text):
 
 async def ask_llm(prompt, model=None, format=None):
     target_model = model if model else OLLAMA_MODEL
+    keep_alive_val = "2h" if bridge_active else "30m"
     async with aiohttp.ClientSession() as session:
         for attempt in range(2):
             try:
@@ -278,7 +389,7 @@ async def ask_llm(prompt, model=None, format=None):
                     "model": target_model,
                     "prompt": prompt,
                     "stream": False,
-                    "keep_alive": "30m",
+                    "keep_alive": keep_alive_val,
                     "options": {"temperature": 0.7}
                 }
                 if format: payload["format"] = format
@@ -291,8 +402,30 @@ async def ask_llm(prompt, model=None, format=None):
                 await asyncio.sleep(1)
     return None
 
+async def warmup_ollama():
+    try:
+        res = await ask_llm('Say "ready" in one word.')
+        if res: print(f"[DEBUG] Ollama warmup success: {res.strip()}", flush=True)
+        else: print("[WARNING] Ollama warmup returned no response.", flush=True)
+    except Exception as e:
+        if DEBUG: print(f"[DEBUG] Ollama warmup error: {e}", flush=True)
+
+async def release_ollama_vram():
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": "bye",
+                "stream": False,
+                "keep_alive": "0"
+            }
+            async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=5)):
+                pass
+    except Exception:
+        pass
+
 async def ask_llm_sentiment(title, artist, playlist_name):
-    global current_persona, transcript_history
+    global current_persona, transcript_history, bridge_active
     system_prompt = PERSONA_PROMPTS.get(current_persona, PERSONA_PROMPTS["unhinged"])
     time_str = datetime.now().strftime("%I:%M %p")
     
@@ -311,14 +444,16 @@ Recent voice channel conversation:
 
 React to the room and the music with ONE single punchy line in your persona. Do not include quotes, tags, or explanations. Just the line:"""
 
+    keep_alive_val = "2h" if bridge_active else "30m"
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "keep_alive": "30m",
-                "options": {"temperature": 0.8}
+                "keep_alive": keep_alive_val,
+                "options": {"temperature": 0.8},
+                "think": False
             }
             async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
                 if resp.status == 200:
@@ -328,6 +463,16 @@ React to the room and the music with ONE single punchy line in your persona. Do 
                         response_text = response_text[1:-1].strip()
                     if response_text:
                         return response_text
+                elif resp.status == 400:
+                    payload.pop("think", None)
+                    async with session.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp2:
+                        if resp2.status == 200:
+                            data = await resp2.json()
+                            response_text = data.get("response", "").strip()
+                            if response_text.startswith('"') and response_text.endswith('"'):
+                                response_text = response_text[1:-1].strip()
+                            if response_text:
+                                return response_text
     except Exception as e:
         if DEBUG: print(f"[DEBUG] Sentiment LLM failed: {e}")
     return "Vibing out."
@@ -585,7 +730,8 @@ async def handle_direct_playlist(url: str, ctx=None, channel=None):
     elif target_channel:
         await target_channel.send(send_msg)
 
-    global pick_gen
+    global pick_gen, playback_intent
+    playback_intent = "playing"
     pick_gen += 1
     explicit_playlist = {"source": source, "ref": ref, "title": title}
     asyncio.create_task(start_walk(
@@ -598,13 +744,7 @@ async def handle_direct_playlist(url: str, ctx=None, channel=None):
     ))
 
 # Walk Engine
-async def prefetch_task(duration_sec, gen_id):
-    global pick_gen
-    await asyncio.sleep(max(0, duration_sec - 45))
-    if pick_gen == gen_id:
-        await advance_walk(trigger="prefetch", gen_id=pick_gen)
-
-async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=None, initial_start_index=None, prefetched_tracks=None):
+async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=None, initial_start_index=None, prefetched_tracks=None, interrupt=True):
     global walk_state, pick_gen, walk_in_flight
     if walk_in_flight:
         for _ in range(60):
@@ -684,14 +824,19 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
                         "tracks_played": 1,
                         "max_tracks": 1,
                         "single_song": song,
-                        "explicit_playlist": None
+                        "explicit_playlist": None,
+                        "started_ts": time.time()
                     }
-                    await send_bridge_cmd({"cmd": "stop"})
-                    await send_bridge_cmd({"cmd": "queue", "url": song["url"], "title": song["title"], "artist": song["artist"]})
+                    if interrupt:
+                        await send_bridge_cmd({"cmd": "stop"})
+                    await send_bridge_cmd({
+                        "cmd": "queue",
+                        "url": song["url"],
+                        "title": song["title"],
+                        "artist": song["artist"],
+                        "video_id": song.get("video_id")
+                    })
                     log_pick("echo", query, source, "Direct Search", song["title"], song["artist"], song.get("video_id"))
-                    d_sec = parse_duration_seconds(song.get("duration", 180))
-                    if d_sec > 45:
-                        bot.loop.create_task(prefetch_task(d_sec, pick_gen))
                     return
                 else:
                     # 5d. Song search also fails: TTS "couldn't find <query>" and keep current walk
@@ -719,7 +864,8 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
             "tracks_played": 0,
             "max_tracks": random.randint(10, 15),
             "single_song": None,
-            "explicit_playlist": explicit_playlist
+            "explicit_playlist": explicit_playlist,
+            "started_ts": time.time()
         }
         
         # 6c. DEDUP: check video ID against recent_played_vids
@@ -738,14 +884,17 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
 
         if pick_gen != gen_id: return
 
-        # Stop old playback and queue new track immediately
-        await send_bridge_cmd({"cmd": "stop"})
-        await send_bridge_cmd({"cmd": "queue", "url": track["url"], "title": track["title"], "artist": track["artist"]})
+        # Stop old playback and queue new track immediately if interrupting
+        if interrupt:
+            await send_bridge_cmd({"cmd": "stop"})
+        await send_bridge_cmd({
+            "cmd": "queue",
+            "url": track["url"],
+            "title": track["title"],
+            "artist": track["artist"],
+            "video_id": track.get("video_id")
+        })
         log_pick("echo", query or final_playlist_name, source, walk_state["playlist_name"], track["title"], track["artist"], track.get("video_id"))
-        
-        d_sec = parse_duration_seconds(track.get("duration"))
-        if d_sec > 45:
-            bot.loop.create_task(prefetch_task(d_sec, pick_gen))
             
     except Exception as e:
         print(f"[ERROR] start_walk failed: {e}", flush=True)
@@ -761,16 +910,17 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
     finally:
         walk_in_flight = False
 
-async def advance_walk(trigger="queue_empty", gen_id=0):
+async def advance_walk(trigger="keep_ahead", gen_id=0):
     global walk_state, pick_gen
     if pick_gen != gen_id: return
+    if not bridge_active: return
     
     tracks = walk_state.get("tracks", [])
     if not tracks:
         await re_roll_walk(gen_id=gen_id)
         return
 
-    walk_state["tracks_played"] += 1
+    walk_state["tracks_played"] = walk_state.get("tracks_played", 0) + 1
     if walk_state["tracks_played"] >= walk_state.get("max_tracks", 12):
         await re_roll_walk(gen_id=gen_id)
         return
@@ -791,27 +941,30 @@ async def advance_walk(trigger="queue_empty", gen_id=0):
         walk_state["index"] = start_idx
 
     if pick_gen != gen_id: return
-    await send_bridge_cmd({"cmd": "queue", "url": track["url"], "title": track["title"], "artist": track["artist"]})
+    await send_bridge_cmd({
+        "cmd": "queue",
+        "url": track["url"],
+        "title": track["title"],
+        "artist": track["artist"],
+        "video_id": track.get("video_id")
+    })
     log_pick(trigger, walk_state.get("query", ""), walk_state.get("source", "ytmusic"), walk_state.get("playlist_name", ""), track["title"], track["artist"], track.get("video_id"))
-    
-    d_sec = parse_duration_seconds(track.get("duration"))
-    if d_sec > 45:
-        bot.loop.create_task(prefetch_task(d_sec, pick_gen))
 
 async def re_roll_walk(gen_id=0):
     global walk_state, pick_gen
     if pick_gen != gen_id: return
+    if not bridge_active: return
     
     explicit = walk_state.get("explicit_playlist")
     if explicit:
-        await start_walk(query="", source=explicit.get("source", "ytmusic"), gen_id=gen_id, explicit_playlist=explicit)
+        await start_walk(query="", source=explicit.get("source", "ytmusic"), gen_id=gen_id, explicit_playlist=explicit, interrupt=False)
         return
 
     query = walk_state.get("query")
     source = walk_state.get("source", "ytmusic")
     
     if query:
-        await start_walk(query, source=source, gen_id=gen_id)
+        await start_walk(query, source=source, gen_id=gen_id, interrupt=False)
     else:
         pid, name = get_curated_playlist()
         if pid:
@@ -827,14 +980,27 @@ async def re_roll_walk(gen_id=0):
                     "tracks_played": 0,
                     "max_tracks": random.randint(10, 15),
                     "single_song": None,
-                    "explicit_playlist": None
+                    "explicit_playlist": None,
+                    "started_ts": time.time()
                 }
                 track = tracks[offset]
-                await send_bridge_cmd({"cmd": "queue", "url": track["url"], "title": track["title"], "artist": track["artist"]})
+                await send_bridge_cmd({
+                    "cmd": "queue",
+                    "url": track["url"],
+                    "title": track["title"],
+                    "artist": track["artist"],
+                    "video_id": track.get("video_id")
+                })
                 log_pick("autoplay", "curated", "ytmusic", walk_state["playlist_name"], track["title"], track["artist"], track.get("video_id"))
-                d_sec = parse_duration_seconds(track.get("duration"))
-                if d_sec > 45:
-                    bot.loop.create_task(prefetch_task(d_sec, pick_gen))
+
+async def check_and_queue_ahead(gen_id):
+    if not bridge_active or pick_gen != gen_id:
+        return
+    res = await send_bridge_cmd({"cmd": "status"}, wait_for_reply=True)
+    if not res or pick_gen != gen_id:
+        return
+    if res.get("queue", 0) == 0:
+        await advance_walk(trigger="keep_ahead", gen_id=gen_id)
 
 async def fetch_lyrics(title: str, artist: str) -> str | None:
     try:
@@ -925,7 +1091,7 @@ async def announce_track_start(title, artist, url, video_id):
     
     # Snapshot walk state synchronously so the embed reflects this track.
     playlist_name = walk_state.get("playlist_name") or "Curated"
-    track_idx = walk_state.get("tracks_played", 1)
+    track_idx = (walk_state.get("index", 0)) + 1
     total_tracks = len(walk_state.get("tracks", []))
     track_meta = f"track {track_idx}/{total_tracks}" if total_tracks > 1 else "track 1/1"
     
@@ -952,7 +1118,7 @@ async def announce_track_start(title, artist, url, video_id):
 
 # Voice Command Parser
 async def handle_voice_command(text, user_id):
-    global current_persona, pick_gen
+    global current_persona, pick_gen, playback_intent
     
     wake_matches = list(re.finditer(r'(hey\s+)?(echo|ecko|eco)[,\s]*', text, flags=re.IGNORECASE))
     wake_text = text[wake_matches[-1].end():] if wake_matches else text
@@ -962,13 +1128,15 @@ async def handle_voice_command(text, user_id):
     channel = bot.get_channel(TEXT_CHANNEL_ID)
     
     # Control patterns
-    if re.search(r'^(skip|next)(\s+song|\s+track)?$', clean_norm, re.IGNORECASE):
+    if re.search(r'^(skip|next)\b', clean_norm, re.IGNORECASE):
+        playback_intent = "playing"
         await send_bridge_cmd({"cmd": "skip"})
         asyncio.create_task(speak("Skipping."))
         if channel: await channel.send("⏭️ Skipping track.")
         return
 
-    if re.search(r'^(back|previous)(\s+song|\s+track)?$', clean_norm, re.IGNORECASE):
+    if re.search(r'^(back|previous)\b', clean_norm, re.IGNORECASE):
+        playback_intent = "playing"
         res = await send_bridge_cmd({"cmd": "back"}, wait_for_reply=True)
         if res and res.get("event") == "error":
             asyncio.create_task(speak("Nothing before this."))
@@ -978,19 +1146,21 @@ async def handle_voice_command(text, user_id):
             if channel: await channel.send("⏪ Playing previous track.")
         return
 
-    if re.search(r'^pause(\s+the\s+music|\s+playback)?$', clean_norm, re.IGNORECASE):
+    if re.search(r'^pause\b', clean_norm, re.IGNORECASE):
         await send_bridge_cmd({"cmd": "pause"})
         asyncio.create_task(speak("Paused."))
         if channel: await channel.send("⏸️ Paused.")
         return
 
-    if re.search(r'^(resume|unpause|continue)(\s+the\s+music|\s+playback)?$', clean_norm, re.IGNORECASE):
+    if re.search(r'^(resume|unpause|continue)\b', clean_norm, re.IGNORECASE):
+        playback_intent = "playing"
         await send_bridge_cmd({"cmd": "resume"})
         asyncio.create_task(speak("Resuming."))
         if channel: await channel.send("▶️ Resumed.")
         return
 
-    if re.search(r'^stop(\s+the\s+music|\s+playback|\s+radio|\s+mix)?$', clean_norm, re.IGNORECASE):
+    if re.search(r'^stop\b', clean_norm, re.IGNORECASE):
+        playback_intent = "stopped"
         await send_bridge_cmd({"cmd": "stop"})
         asyncio.create_task(speak("Stopped."))
         if channel: await channel.send("⏹️ Stopped.")
@@ -1008,7 +1178,8 @@ async def handle_voice_command(text, user_id):
             if channel: await channel.send("🎵 Nothing is playing right now.")
         return
 
-    if re.search(r'^(play\s+(a\s+)?mix|radio|start\s+(a\s+)?radio|autoplay)$', clean_norm, re.IGNORECASE):
+    if re.search(r'^(play\s+(a\s+)?mix|radio|start\s+(a\s+)?radio|autoplay)\b', clean_norm, re.IGNORECASE):
+        playback_intent = "playing"
         pick_gen += 1
         asyncio.create_task(speak("Radio mode on."))
         if channel: await channel.send("📻 Rolling the radio mix...")
@@ -1031,6 +1202,8 @@ async def handle_voice_command(text, user_id):
             flags=re.IGNORECASE
         ).strip()
         
+        query = re.split(r'[.!?]+', query)[0].strip()
+        
         source = "ytmusic"
         if re.search(r'\bon\s+soundcloud\b', query, re.IGNORECASE):
             source = "soundcloud"
@@ -1039,6 +1212,13 @@ async def handle_voice_command(text, user_id):
         query = query.strip(" .,!?:;'\"")
         
         if query:
+            norm = re.sub(r"\s+", " ", query.strip().lower())
+            cur = re.sub(r"\s+", " ", str(walk_state.get("query", "")).strip().lower())
+            if norm and norm == cur and walk_state.get("tracks") and (time.time() - walk_state.get("started_ts", 0)) < 30:
+                await speak("already on it")
+                return
+
+            playback_intent = "playing"
             ack_msg = get_tts_ack(query, current_persona)
             asyncio.create_task(speak(ack_msg))
             if channel:
@@ -1157,23 +1337,42 @@ async def handle_bridge_client(reader, writer):
                         title = header.get('title', '')
                         artist = header.get('artist', '')
                         url = header.get('url', '')
-                        vid = None
-                        if url:
-                            if "v=" in url: vid = url.split("v=")[-1].split("&")[0]
-                            elif "youtu.be/" in url: vid = u = url.split("youtu.be/")[-1].split("?")[0]
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ▶️ Now playing: {title} — {artist}", flush=True)
+                        vid = header.get('video_id')
+                        
+                        # Self-heal walk index from video_id
+                        tracks = walk_state.get("tracks", [])
+                        if tracks:
+                            found_idx = None
+                            if vid:
+                                for idx, t in enumerate(tracks):
+                                    if t.get("video_id") == vid:
+                                        found_idx = idx
+                                        break
+                            if found_idx is not None:
+                                walk_state["index"] = found_idx
+                            else:
+                                walk_state["index"] = (walk_state.get("index", 0) + 1) % len(tracks)
+
+                        walk_state["tracks_played"] = walk_state.get("tracks_played", 0) + 1
+                        
                         log_play_history(title, artist, url, vid, walk_state.get("playlist_name", ""))
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ▶️ Now playing: {title} — {artist} ({vid or 'no-id'})", flush=True)
                         asyncio.create_task(announce_track_start(title, artist, url, vid))
+                        asyncio.create_task(check_and_queue_ahead(pick_gen))
                     elif evt == "queue_empty":
                         player_state = header.get("player", "idle")
-                        if player_state != "playing":
+                        if playback_intent == "stopped":
+                            if DEBUG: print("[DEBUG] Ignoring queue_empty: playback_intent == 'stopped'", flush=True)
+                        elif player_state != "playing":
                             pick_gen += 1
                             asyncio.create_task(advance_walk(trigger="queue_empty", gen_id=pick_gen))
                     continue
 
                 user_id = int(header["u"])
                 n = int(header["n"])
-            except: continue
+            except Exception as e:
+                if DEBUG: print(f"[DEBUG] handle_bridge_client packet error: {e}", flush=True)
+                continue
 
             data = await reader.readexactly(n)
             if user_id not in user_buffers: user_buffers[user_id] = UserAudioBuffer(user_id)
@@ -1185,6 +1384,8 @@ async def handle_bridge_client(reader, writer):
         bridge_active = False
         bridge_writer = None
         writer.close()
+        if not intentional_leave:
+            asyncio.create_task(reconnect_bridge_supervisor())
 
 # Persona UI Components
 class PersonaSelect(discord.ui.Select):
@@ -1208,49 +1409,73 @@ class PersonaView(discord.ui.View):
 
 # Slash Commands
 @bot.slash_command(name="join", description="Join the configured voice channel")
-async def join(ctx):
-    await ctx.defer()
-    global bridge_process, bridge_server, bridge_active, intentional_leave, pick_gen
+async def join(ctx=None):
+    if ctx:
+        await ctx.defer()
+    global bridge_process, bridge_server, bridge_active, intentional_leave, pick_gen, playback_intent
     intentional_leave = False
+    playback_intent = "playing"
+    channel = bot.get_channel(TEXT_CHANNEL_ID)
     if bridge_active:
-        return await ctx.followup.send("Already joined and listening via Node bridge! 🎧", view=PersonaView())
+        if ctx: return await ctx.followup.send("Already joined and listening via Node bridge! 🎧", view=PersonaView())
+        elif channel: return await channel.send("Already joined and listening via Node bridge! 🎧")
+        return
     if not bridge_server:
         bridge_server = await asyncio.start_server(handle_bridge_client, '127.0.0.1', BRIDGE_PORT)
     bridge_connected_event.clear()
     try:
-        bridge_process = subprocess.Popen(["node", "voice-bridge/bridge.js"], cwd=os.getcwd())
+        spawn_bridge()
     except Exception as e:
-        return await ctx.followup.send(f"Failed to start Node bridge: {e}")
+        msg = f"Failed to start Node bridge: {e}"
+        if ctx: return await ctx.followup.send(msg)
+        elif channel: return await channel.send(msg)
+        return
     try:
         await asyncio.wait_for(bridge_connected_event.wait(), timeout=15.0)
-        await ctx.followup.send("Joined and listening via Node bridge! 🎧 Pick a persona:", view=PersonaView())
+        msg = "Joined and listening via Node bridge! 🎧 Pick a persona:"
+        if ctx: await ctx.followup.send(msg, view=PersonaView())
+        elif channel: await channel.send(msg)
+        asyncio.create_task(warmup_ollama())
         if JOIN_AUTOPLAY:
             pick_gen += 1
             asyncio.create_task(re_roll_walk(gen_id=pick_gen))
     except asyncio.TimeoutError:
         if bridge_process: bridge_process.terminate()
-        await ctx.followup.send("Failed to join: Bridge did not connect in time.")
+        msg = "Failed to join: Bridge did not connect in time."
+        if ctx: await ctx.followup.send(msg)
+        elif channel: await channel.send(msg)
 
 @bot.slash_command(name="leave", description="Leave the voice channel")
-async def leave(ctx):
-    global bridge_process, bridge_server, bridge_active, intentional_leave
-    await ctx.defer()
+async def leave(ctx=None):
+    global bridge_process, bridge_server, bridge_active, intentional_leave, playback_intent
+    if ctx:
+        await ctx.defer()
     intentional_leave = True
+    playback_intent = "stopped"
     await send_bridge_cmd({"cmd": "stop"})
     if bridge_process: bridge_process.terminate(); bridge_process = None
     if bridge_server: bridge_server.close(); await bridge_server.wait_closed(); bridge_server = None
     bridge_active = False
-    await ctx.followup.send("Left the channel.")
+    asyncio.create_task(release_ollama_vram())
+    msg = "Left the channel."
+    if ctx: await ctx.followup.send(msg)
+    else:
+        channel = bot.get_channel(TEXT_CHANNEL_ID)
+        if channel: await channel.send(msg)
 
 @bot.slash_command(name="skip", description="Skip current track")
 async def skip(ctx):
+    global playback_intent
     await ctx.defer()
+    playback_intent = "playing"
     await send_bridge_cmd({"cmd": "skip"})
     await ctx.followup.send("Skipped current track ⏭️")
 
 @bot.slash_command(name="back", description="Play previous track")
 async def back(ctx):
+    global playback_intent
     await ctx.defer()
+    playback_intent = "playing"
     res = await send_bridge_cmd({"cmd": "back"}, wait_for_reply=True)
     if res and res.get("event") == "error": await ctx.followup.send(f"❌ {res.get('message')}")
     else: await ctx.followup.send("Going back to previous track ⏪")
@@ -1263,13 +1488,17 @@ async def pause(ctx):
 
 @bot.slash_command(name="resume", description="Resume playback")
 async def resume(ctx):
+    global playback_intent
     await ctx.defer()
+    playback_intent = "playing"
     await send_bridge_cmd({"cmd": "resume"})
     await ctx.followup.send("Resumed playback ▶️")
 
 @bot.slash_command(name="stop", description="Stop playback and clear queue")
 async def stop(ctx):
+    global playback_intent
     await ctx.defer()
+    playback_intent = "stopped"
     await send_bridge_cmd({"cmd": "stop"})
     await ctx.followup.send("Playback stopped ⏹️")
 
@@ -1317,6 +1546,8 @@ async def status(ctx):
 
 @bot.slash_command(name="playlist", description="Play a direct playlist from YouTube or SoundCloud")
 async def playlist_cmd(ctx, url: str):
+    global playback_intent
+    playback_intent = "playing"
     await handle_direct_playlist(url, ctx=ctx)
 
 @bot.event
@@ -1329,19 +1560,37 @@ async def on_message(message):
     if url:
         await handle_direct_playlist(url, channel=message.channel)
 
+async def command_file_watcher():
+    cmd_file = "bot_cmd.txt"
+    while True:
+        try:
+            if os.path.exists(cmd_file):
+                with open(cmd_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                try:
+                    os.remove(cmd_file)
+                except Exception:
+                    pass
+                if content:
+                    print(f"[CMD-PIPE] Received command: {content}", flush=True)
+                    if content == "join":
+                        await join(ctx=None)
+                    elif content == "leave":
+                        await leave(ctx=None)
+                    elif content.startswith("Echo") or content.startswith("echo") or content.startswith("hey echo"):
+                        await handle_voice_command(content, 0)
+        except Exception as e:
+            if DEBUG: print(f"[DEBUG] command_file_watcher error: {e}", flush=True)
+        await asyncio.sleep(0.5)
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     
     print("[DEBUG] Warming up Ollama...")
-    async def warmup():
-        await asyncio.sleep(3)
-        res = await ask_llm('Say "ready" in one word.')
-        if res: print(f"[DEBUG] Ollama warmup success: {res.strip()}")
-        else: print("[WARNING] Ollama warmup returned no response.")
-    bot.loop.create_task(warmup())
-        
+    bot.loop.create_task(warmup_ollama())
     bot.loop.create_task(transcribe_worker())
+    bot.loop.create_task(command_file_watcher())
 
 if __name__ == "__main__":
     if not os.path.exists("logs"): os.makedirs("logs")
