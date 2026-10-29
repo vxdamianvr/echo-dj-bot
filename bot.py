@@ -219,9 +219,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Bot(intents=intents)
 
-print(f"[DEBUG] Loading WhisperModel '{WHISPER_MODEL}'...")
-stt_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-print("[DEBUG] WhisperModel loaded.")
+stt_model = None
+
+def get_stt_model():
+    global stt_model
+    if stt_model is None:
+        print(f"[DEBUG] Loading WhisperModel '{WHISPER_MODEL}'...")
+        stt_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        print("[DEBUG] WhisperModel loaded.")
+    return stt_model
 
 utterance_queue = asyncio.Queue()
 transcript_history = []
@@ -1157,76 +1163,38 @@ async def handle_back_command(channel=None, ctx=None):
             await channel.send("⏪ Playing previous track.")
     return True
 
-# Voice Command Parser
-async def handle_voice_command(text, user_id):
-    global current_persona, pick_gen, playback_intent
-    
+def parse_voice_command(text):
     wake_matches = list(re.finditer(r'(hey\s+)?(echo|ecko|eco)[,\s]*', text, flags=re.IGNORECASE))
     wake_text = text[wake_matches[-1].end():] if wake_matches else text
     clean = wake_text.strip()
     clean_norm = clean.strip(" .,!?:;'\"")
     
-    channel = bot.get_channel(TEXT_CHANNEL_ID)
-    
-    # Control patterns
     if re.search(r'^(skip|next)\b', clean_norm, re.IGNORECASE):
-        playback_intent = "playing"
-        await send_bridge_cmd({"cmd": "skip"})
-        asyncio.create_task(speak("Skipping."))
-        if channel: await channel.send("⏭️ Skipping track.")
-        return
+        return {"action": "skip", "query": None, "source": None}
 
     if re.search(r'^(back|previous)\b', clean_norm, re.IGNORECASE):
-        await handle_back_command(channel=channel)
-        return
+        return {"action": "back", "query": None, "source": None}
 
     if re.search(r'^pause\b', clean_norm, re.IGNORECASE):
-        await send_bridge_cmd({"cmd": "pause"})
-        asyncio.create_task(speak("Paused."))
-        if channel: await channel.send("⏸️ Paused.")
-        return
+        return {"action": "pause", "query": None, "source": None}
 
     if re.search(r'^(resume|unpause|continue)\b', clean_norm, re.IGNORECASE):
-        playback_intent = "playing"
-        await send_bridge_cmd({"cmd": "resume"})
-        asyncio.create_task(speak("Resuming."))
-        if channel: await channel.send("▶️ Resumed.")
-        return
+        return {"action": "resume", "query": None, "source": None}
 
     if re.search(r'^stop\b', clean_norm, re.IGNORECASE):
-        playback_intent = "stopped"
-        await send_bridge_cmd({"cmd": "stop"})
-        asyncio.create_task(speak("Stopped."))
-        if channel: await channel.send("⏹️ Stopped.")
-        return
+        return {"action": "stop", "query": None, "source": None}
 
     if re.search(r'^(what\'?s\s+playing|what\s+is\s+(this|playing))', clean_norm, re.IGNORECASE):
-        bridge_data = await send_bridge_cmd({"cmd": "status"}, wait_for_reply=True)
-        if bridge_data and bridge_data.get("playing"):
-            p = bridge_data["playing"]
-            reply = f"That's {p['title']} by {p['artist']}."
-            asyncio.create_task(speak(reply))
-            if channel: await channel.send(f"🎵 {reply}")
-        else:
-            asyncio.create_task(speak("Nothing is playing right now."))
-            if channel: await channel.send("🎵 Nothing is playing right now.")
-        return
+        return {"action": "whats_playing", "query": None, "source": None}
 
     if re.search(r'^(play\s+(a\s+)?mix|radio|start\s+(a\s+)?radio|autoplay)\b', clean_norm, re.IGNORECASE):
-        playback_intent = "playing"
-        pick_gen += 1
-        asyncio.create_task(speak("Radio mode on."))
-        if channel: await channel.send("📻 Rolling the radio mix...")
-        asyncio.create_task(re_roll_walk(gen_id=pick_gen))
-        return
+        return {"action": "radio", "query": None, "source": None}
 
-    # Play pattern
     play_match = re.match(
         r'^(play|put\s+on|throw\s+on|spin|drop|queue|start)\s+(.*)',
         clean_norm,
         re.IGNORECASE
     )
-    
     if play_match:
         remainder = play_match.group(2).strip()
         query = re.sub(
@@ -1244,23 +1212,98 @@ async def handle_voice_command(text, user_id):
             query = re.sub(r'\bon\s+soundcloud\b', '', query, flags=re.IGNORECASE).strip()
 
         query = query.strip(" .,!?:;'\"")
-        
         if query:
-            norm = re.sub(r"\s+", " ", query.strip().lower())
-            cur = re.sub(r"\s+", " ", str(walk_state.get("query", "")).strip().lower())
-            if norm and norm == cur and walk_state.get("tracks") and (time.time() - walk_state.get("started_ts", 0)) < 30:
-                await speak("already on it")
-                return
+            return {"action": "play", "query": query, "source": source}
 
-            playback_intent = "playing"
-            ack_msg = get_tts_ack(query, current_persona)
-            asyncio.create_task(speak(ack_msg))
-            if channel:
-                await channel.send(f"👂 {ack_msg}")
-            
-            pick_gen += 1
-            asyncio.create_task(start_walk(query=query, source=source, gen_id=pick_gen))
+    return {"action": "unparseable", "query": None, "source": None}
+
+def is_play_debounced(query, walk_state, now=None):
+    if not query:
+        return False
+    if now is None:
+        now = time.time()
+    norm = re.sub(r"\s+", " ", query.strip().lower())
+    cur = re.sub(r"\s+", " ", str(walk_state.get("query", "")).strip().lower())
+    if norm and norm == cur and walk_state.get("tracks") and (now - walk_state.get("started_ts", 0)) < 30:
+        return True
+    return False
+
+# Voice Command Parser
+async def handle_voice_command(text, user_id):
+    global current_persona, pick_gen, playback_intent
+    
+    parsed = parse_voice_command(text)
+    action = parsed["action"]
+    query = parsed["query"]
+    source = parsed["source"]
+    
+    channel = bot.get_channel(TEXT_CHANNEL_ID)
+    
+    if action == "skip":
+        playback_intent = "playing"
+        await send_bridge_cmd({"cmd": "skip"})
+        asyncio.create_task(speak("Skipping."))
+        if channel: await channel.send("⏭️ Skipping track.")
+        return
+
+    if action == "back":
+        await handle_back_command(channel=channel)
+        return
+
+    if action == "pause":
+        await send_bridge_cmd({"cmd": "pause"})
+        asyncio.create_task(speak("Paused."))
+        if channel: await channel.send("⏸️ Paused.")
+        return
+
+    if action == "resume":
+        playback_intent = "playing"
+        await send_bridge_cmd({"cmd": "resume"})
+        asyncio.create_task(speak("Resuming."))
+        if channel: await channel.send("▶️ Resumed.")
+        return
+
+    if action == "stop":
+        playback_intent = "stopped"
+        await send_bridge_cmd({"cmd": "stop"})
+        asyncio.create_task(speak("Stopped."))
+        if channel: await channel.send("⏹️ Stopped.")
+        return
+
+    if action == "whats_playing":
+        bridge_data = await send_bridge_cmd({"cmd": "status"}, wait_for_reply=True)
+        if bridge_data and bridge_data.get("playing"):
+            p = bridge_data["playing"]
+            reply = f"That's {p['title']} by {p['artist']}."
+            asyncio.create_task(speak(reply))
+            if channel: await channel.send(f"🎵 {reply}")
+        else:
+            asyncio.create_task(speak("Nothing is playing right now."))
+            if channel: await channel.send("🎵 Nothing is playing right now.")
+        return
+
+    if action == "radio":
+        playback_intent = "playing"
+        pick_gen += 1
+        asyncio.create_task(speak("Radio mode on."))
+        if channel: await channel.send("📻 Rolling the radio mix...")
+        asyncio.create_task(re_roll_walk(gen_id=pick_gen))
+        return
+
+    if action == "play":
+        if is_play_debounced(query, walk_state):
+            await speak("already on it")
             return
+
+        playback_intent = "playing"
+        ack_msg = get_tts_ack(query, current_persona)
+        asyncio.create_task(speak(ack_msg))
+        if channel:
+            await channel.send(f"👂 {ack_msg}")
+        
+        pick_gen += 1
+        asyncio.create_task(start_walk(query=query, source=source, gen_id=pick_gen))
+        return
 
     # Unparseable
     unparseable_msg = get_tts_unparseable(current_persona)
@@ -1311,7 +1354,8 @@ class UserAudioBuffer:
 
 def do_transcribe(audio_np):
     try:
-        segments, info = stt_model.transcribe(audio_np, beam_size=1, language=SPOKEN_LANGUAGE, initial_prompt="Echo")
+        model = get_stt_model()
+        segments, info = model.transcribe(audio_np, beam_size=1, language=SPOKEN_LANGUAGE, initial_prompt="Echo")
         text = " ".join(segment.text for segment in segments if segment.no_speech_prob < 0.5).strip()
         return text
     except: return ""
@@ -1632,6 +1676,7 @@ async def on_ready():
     
     print("[DEBUG] Warming up Ollama...")
     bot.loop.create_task(warmup_ollama())
+    get_stt_model()
     bot.loop.create_task(transcribe_worker())
     bot.loop.create_task(command_file_watcher())
 

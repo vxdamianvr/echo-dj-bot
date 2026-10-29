@@ -24,6 +24,7 @@ logs/
 Thumbs.db
 desktop.ini
 .vscode/
+*.code-workspace
 .idea/
 
 # Model binaries (large, re-downloadable)
@@ -35,5 +36,5 @@ voice-bridge/temp_audio/
 play_history.jsonl
 bot_cmd.txt
 
-*_test.py
-test_*.py
+*_scratch.py
+scratch_*.py
