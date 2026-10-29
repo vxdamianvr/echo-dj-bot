@@ -133,8 +133,9 @@ async def test_announce_track_start_and_large_artwork():
             print("  [PASS] F1: No image set when video_id is absent")
 
 async def test_g1_finalize_now_playing():
-    print("--- Testing G1: Finalize Now Playing (One-Liner & Inline Miss) ---")
+    print("--- Testing G1 & H1: Finalize Now Playing (Emoji Bookends & Inline Miss) ---")
     base_desc = "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)\nvia \"Curated\" · track 1/1"
+    bot.current_persona = "velvet"
 
     # Case A: Lyrics found
     mock_channel = MagicMock()
@@ -152,10 +153,12 @@ async def test_g1_finalize_now_playing():
 
         await bot._finalize_now_playing(mock_message, mock_thread, "Hit Song", "Pop Star", "Curated", "vid123", base_desc=base_desc)
 
-        # First edit sets sentiment as message content
+        # First edit sets sentiment as message content with persona emoji
         mock_message.edit.assert_awaited_once()
         _, edit_kwargs = mock_message.edit.call_args
-        assert edit_kwargs['content'] == "Certified banger.", "One-liner must be message content"
+        assert edit_kwargs['content'] == "🍸 Certified banger.", "One-liner must start with persona emoji"
+        assert edit_kwargs['content'].startswith("🍸")
+        assert not edit_kwargs['content'].endswith("🎵")
         edited_embed = edit_kwargs['embed']
         assert edited_embed.description == base_desc, "Embed description must contain only the 2 base info lines"
         assert edited_embed.image.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Large image must be preserved"
@@ -165,9 +168,10 @@ async def test_g1_finalize_now_playing():
         mock_thread.delete.assert_not_called()
         mock_channel.send.assert_not_called()
         assert "no lyrics found" not in edit_kwargs['content']
-        print("  [PASS] G1 Case A: One-liner as message content, embed description kept clean, lyrics in thread, no miss indicator")
+        print("  [PASS] G1/H1 Case A: One-liner starts with persona emoji, lyrics in thread, no miss indicator")
 
-    # Case B: Lyrics miss -> inline indicator appended, thread deleted, no separate channel message
+    # Case B: Lyrics miss -> inline indicator appended with trailing 🎵, thread deleted, no separate channel message
+    bot.current_persona = "unhinged"
     mock_channel.reset_mock()
     mock_message.reset_mock()
     mock_message.edit = AsyncMock()
@@ -181,19 +185,21 @@ async def test_g1_finalize_now_playing():
 
         await bot._finalize_now_playing(mock_message, mock_thread, "Obscure Song", "Unknown", "Curated", "vid123", base_desc=base_desc)
 
-        # Expected 2 edits: (1) content="Late night vibe.", (2) content="Late night vibe. · 🎵 no lyrics found"
+        # Expected 2 edits: (1) content="🤪 Late night vibe.", (2) content="🤪 Late night vibe. · no lyrics found 🎵"
         assert mock_message.edit.await_count == 2
         calls = mock_message.edit.call_args_list
-        assert calls[0].kwargs['content'] == "Late night vibe."
+        assert calls[0].kwargs['content'] == "🤪 Late night vibe."
         second_edit_content = calls[1].kwargs['content']
-        assert second_edit_content == "Late night vibe. · 🎵 no lyrics found"
-        assert second_edit_content.endswith("· 🎵 no lyrics found")
+        assert second_edit_content == "🤪 Late night vibe. · no lyrics found 🎵"
+        assert second_edit_content.startswith("🤪")
+        assert second_edit_content.endswith("· no lyrics found 🎵")
+        assert "· 🎵 no lyrics found" not in second_edit_content
 
         # Thread deleted, thread send not called, channel send not called
         mock_thread.delete.assert_awaited_once()
         mock_thread.send.assert_not_called()
         mock_channel.send.assert_not_called()
-        print("  [PASS] G1 Case B: Lyrics miss -> empty thread deleted, inline indicator appended, no separate channel message")
+        print("  [PASS] G1/H1 Case B: Starts with emoji, ends with '· no lyrics found 🎵', thread deleted, no separate channel message")
 
 async def main():
     await test_e1_persona_picker_and_switch()

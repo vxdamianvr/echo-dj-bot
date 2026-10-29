@@ -110,6 +110,12 @@ PERSONA_PROMPTS = {
     "hype": "You are ECHO on hype mode: an extremely online hype-man whose entire bit is being catastrophically over-excited about completely ordinary moments. The humor is the mismatch — you react to a song change like a championship win. Self-aware theater kid doing a bit, never a gym bro."
 }
 
+PERSONA_EMOJI = {
+    "unhinged": "🤪",
+    "velvet": "🍸",
+    "hype": "🔥"
+}
+
 current_persona = "unhinged"
 
 def get_tts_ack(query, persona):
@@ -1101,11 +1107,13 @@ async def _finalize_now_playing(message, thread, title, artist, playlist_name, v
     elif getattr(message, "embeds", None) and message.embeds[0].image and message.embeds[0].image.url:
         embed.set_image(url=message.embeds[0].image.url)
 
-    # 4. First edit: content=(sentiment_line or ""), embed=embed
+    # 4. First edit: emoji-led content, embed=embed
+    emoji = PERSONA_EMOJI.get(current_persona, "🎧")
+    content = f"{emoji} {sentiment_line}" if sentiment_line else emoji
     msg_id = getattr(message, "id", None)
     try:
         print(f"[SENTIMENT] [{title}] editing message id={msg_id}...", flush=True)
-        await message.edit(content=(sentiment_line or ""), embed=embed)
+        await message.edit(content=content, embed=embed)
         print(f"[SENTIMENT] [{title}] message id={msg_id} edit SUCCESS: sentiment content set.", flush=True)
     except Exception as e:
         print(f"[SENTIMENT] [{title}] message id={msg_id} edit FAILED: {e}", flush=True)
@@ -1158,7 +1166,7 @@ async def _finalize_now_playing(message, thread, title, artist, playlist_name, v
             except Exception as e:
                 if DEBUG: print(f"[DEBUG] lyrics thread delete failed: {e}", flush=True)
 
-        new_content = (sentiment_line + " · 🎵 no lyrics found") if sentiment_line else "🎵 no lyrics found"
+        new_content = f"{content} · no lyrics found 🎵"
         try:
             print(f"[LYRICS] [{title}] editing message id={msg_id} with miss indicator...", flush=True)
             await message.edit(content=new_content)
@@ -1755,6 +1763,7 @@ async def on_message(message):
         await handle_direct_playlist(url, channel=message.channel)
 
 async def command_file_watcher():
+    global current_persona
     cmd_file = "bot_cmd.txt"
     while True:
         try:
@@ -1771,6 +1780,11 @@ async def command_file_watcher():
                         await join(ctx=None)
                     elif content == "leave":
                         await leave(ctx=None)
+                    elif content.startswith("persona "):
+                        p = content[8:].strip().lower()
+                        if p in PERSONA_EMOJI:
+                            current_persona = p
+                            print(f"[PERSONA] switched to {current_persona}", flush=True)
                     elif content.startswith("queue "):
                         url = content[6:].strip()
                         await send_bridge_cmd({"cmd": "queue", "url": url, "title": "Test Track", "artist": "Test Artist", "video_id": "test_vid"})
