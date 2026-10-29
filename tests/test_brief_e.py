@@ -96,8 +96,8 @@ async def test_e1_persona_picker_and_switch():
         assert bot.last_picker_message == slash_msg
         print("  [PASS] /persona command: retired previous picker, returned fresh picker")
 
-async def test_e2_e4_embed_thumbnail_and_sentiment_append():
-    print("--- Testing E2 & E4 & F1: Embed Image & Sentiment Append ---")
+async def test_announce_track_start_and_large_artwork():
+    print("--- Testing F1: Embed Large Image & Thread Creation ---")
     mock_channel = MagicMock()
     mock_message = MagicMock()
     mock_message.id = 2001
@@ -105,9 +105,7 @@ async def test_e2_e4_embed_thumbnail_and_sentiment_append():
     mock_channel.send = AsyncMock(return_value=mock_message)
 
     with patch.object(bot, 'get_text_channel', AsyncMock(return_value=mock_channel)):
-        # Test announce_track_start
-        with patch.object(bot, 'post_lyrics', AsyncMock()) as mock_post_lyrics, \
-             patch.object(bot, '_append_sentiment', AsyncMock()) as mock_append_sentiment:
+        with patch.object(bot, '_finalize_now_playing', AsyncMock()) as mock_finalize:
             mock_message.create_thread = AsyncMock(return_value=MagicMock())
 
             await bot.announce_track_start("Test Song", "Test Artist", "https://youtube.com/watch?v=vid123", "vid123")
@@ -121,14 +119,12 @@ async def test_e2_e4_embed_thumbnail_and_sentiment_append():
 
             # Check thread created and passed
             mock_message.create_thread.assert_awaited_once_with(name="Lyrics: Test Song", auto_archive_duration=60)
-            mock_post_lyrics.assert_called_once()
-            mock_append_sentiment.assert_called_once()
-            print("  [PASS] E3: Lyrics thread created under message and passed to post_lyrics")
+            mock_finalize.assert_called_once()
+            print("  [PASS] E3: Lyrics thread created under message and passed to _finalize_now_playing")
 
         # Test announce_track_start without video_id (no image)
         mock_channel.send.reset_mock()
-        with patch.object(bot, 'post_lyrics', AsyncMock()), \
-             patch.object(bot, '_append_sentiment', AsyncMock()):
+        with patch.object(bot, '_finalize_now_playing', AsyncMock()):
             await bot.announce_track_start("No Vid Song", "Artist", "https://example.com/audio.mp3", None)
             mock_channel.send.assert_awaited_once()
             _, no_vid_kwargs = mock_channel.send.call_args
@@ -136,56 +132,74 @@ async def test_e2_e4_embed_thumbnail_and_sentiment_append():
             assert no_vid_embed.image is None or no_vid_embed.image.url is None, "No image when video_id is absent"
             print("  [PASS] F1: No image set when video_id is absent")
 
-        # Test _append_sentiment
-        base_desc = "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)\nvia \"Curated\" · track 1/1"
-        with patch.object(bot, 'ask_llm_sentiment', AsyncMock(return_value="Certified banger.")):
-            await bot._append_sentiment(mock_message, base_desc, "Test Song", "Test Artist", "Curated", video_id="vid123")
+async def test_g1_finalize_now_playing():
+    print("--- Testing G1: Finalize Now Playing (One-Liner & Inline Miss) ---")
+    base_desc = "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)\nvia \"Curated\" · track 1/1"
 
-            mock_message.edit.assert_awaited_once()
-            _, edit_kwargs = mock_message.edit.call_args
-            edited_embed = edit_kwargs['embed']
-            lines = edited_embed.description.split("\n")
-            assert len(lines) == 3, f"Expected 3 lines, got: {lines}"
-            assert lines[0] == "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)"
-            assert lines[1] == 'via "Curated" · track 1/1'
-            assert lines[2] == "Certified banger."
-            # Verify large image was NOT wiped
-            assert edited_embed.image.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Large image must be preserved after edit"
-            print("  [PASS] F1 & E4: Sentiment appended as 3rd line and large image preserved")
-
-async def test_e3_lyrics_threading_and_miss_handling():
-    print("--- Testing E3: Lyrics Threading & Miss Handling ---")
+    # Case A: Lyrics found
     mock_channel = MagicMock()
     mock_channel.send = AsyncMock()
-
+    mock_message = MagicMock()
+    mock_message.id = 3001
+    mock_message.edit = AsyncMock()
     mock_thread = MagicMock()
     mock_thread.send = AsyncMock()
     mock_thread.delete = AsyncMock()
 
-    with patch.object(bot, 'get_text_channel', AsyncMock(return_value=mock_channel)):
-        # Case A: Lyrics found -> sent to thread
-        with patch.object(bot, 'fetch_lyrics', AsyncMock(return_value="Line 1\nLine 2")):
-            await bot.post_lyrics("Hit Song", "Pop Star", thread=mock_thread)
-            mock_thread.send.assert_awaited_once()
-            mock_channel.send.assert_not_called()
-            mock_thread.delete.assert_not_called()
-            print("  [PASS] Lyrics found -> posted into thread")
+    with patch.object(bot, 'get_text_channel', AsyncMock(return_value=mock_channel)), \
+         patch.object(bot, 'fetch_lyrics', AsyncMock(return_value="Line 1\nLine 2")), \
+         patch.object(bot, 'ask_llm_sentiment', AsyncMock(return_value="Certified banger.")):
 
-        # Case B: Lyrics miss -> delete thread, post miss notice to main channel
-        mock_thread.reset_mock()
-        mock_channel.reset_mock()
-        with patch.object(bot, 'fetch_lyrics', AsyncMock(return_value=None)):
-            await bot.post_lyrics("Obscure Instrumental", "Unknown", thread=mock_thread)
-            mock_thread.delete.assert_awaited_once()
-            mock_thread.send.assert_not_called()
-            mock_channel.send.assert_awaited_once_with("🎵 Couldn't find lyrics for Obscure Instrumental.")
-            print("  [PASS] Lyrics miss -> thread deleted, notice posted to main channel")
+        await bot._finalize_now_playing(mock_message, mock_thread, "Hit Song", "Pop Star", "Curated", "vid123", base_desc=base_desc)
+
+        # First edit sets sentiment as message content
+        mock_message.edit.assert_awaited_once()
+        _, edit_kwargs = mock_message.edit.call_args
+        assert edit_kwargs['content'] == "Certified banger.", "One-liner must be message content"
+        edited_embed = edit_kwargs['embed']
+        assert edited_embed.description == base_desc, "Embed description must contain only the 2 base info lines"
+        assert edited_embed.image.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Large image must be preserved"
+
+        # Lyrics sent to thread, thread not deleted, no miss indicator
+        mock_thread.send.assert_awaited_once()
+        mock_thread.delete.assert_not_called()
+        mock_channel.send.assert_not_called()
+        assert "no lyrics found" not in edit_kwargs['content']
+        print("  [PASS] G1 Case A: One-liner as message content, embed description kept clean, lyrics in thread, no miss indicator")
+
+    # Case B: Lyrics miss -> inline indicator appended, thread deleted, no separate channel message
+    mock_channel.reset_mock()
+    mock_message.reset_mock()
+    mock_message.edit = AsyncMock()
+    mock_thread.reset_mock()
+    mock_thread.send = AsyncMock()
+    mock_thread.delete = AsyncMock()
+
+    with patch.object(bot, 'get_text_channel', AsyncMock(return_value=mock_channel)), \
+         patch.object(bot, 'fetch_lyrics', AsyncMock(return_value=None)), \
+         patch.object(bot, 'ask_llm_sentiment', AsyncMock(return_value="Late night vibe.")):
+
+        await bot._finalize_now_playing(mock_message, mock_thread, "Obscure Song", "Unknown", "Curated", "vid123", base_desc=base_desc)
+
+        # Expected 2 edits: (1) content="Late night vibe.", (2) content="Late night vibe. · 🎵 no lyrics found"
+        assert mock_message.edit.await_count == 2
+        calls = mock_message.edit.call_args_list
+        assert calls[0].kwargs['content'] == "Late night vibe."
+        second_edit_content = calls[1].kwargs['content']
+        assert second_edit_content == "Late night vibe. · 🎵 no lyrics found"
+        assert second_edit_content.endswith("· 🎵 no lyrics found")
+
+        # Thread deleted, thread send not called, channel send not called
+        mock_thread.delete.assert_awaited_once()
+        mock_thread.send.assert_not_called()
+        mock_channel.send.assert_not_called()
+        print("  [PASS] G1 Case B: Lyrics miss -> empty thread deleted, inline indicator appended, no separate channel message")
 
 async def main():
     await test_e1_persona_picker_and_switch()
-    await test_e2_e4_embed_thumbnail_and_sentiment_append()
-    await test_e3_lyrics_threading_and_miss_handling()
-    print("\nALL UNIT & INTEGRATION TESTS PASSED FOR BRIEF E!")
+    await test_announce_track_start_and_large_artwork()
+    await test_g1_finalize_now_playing()
+    print("\nALL UNIT & INTEGRATION TESTS PASSED FOR BRIEFS E, F & G!")
 
 if __name__ == "__main__":
     asyncio.run(main())

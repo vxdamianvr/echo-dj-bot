@@ -1072,25 +1072,55 @@ async def fetch_lyrics(title: str, artist: str) -> str | None:
     except Exception:
         return None
 
-async def post_lyrics(title: str, artist: str, thread=None):
+async def _finalize_now_playing(message, thread, title, artist, playlist_name, video_id, base_desc=None):
+    if message is None:
+        return
+
+    # 1. Start lyrics fetch concurrently
+    lyrics_task = asyncio.create_task(fetch_lyrics(title, artist))
+
+    # 2. Generate persona sentiment (never waits on lyrics)
+    sentiment_line = ""
     try:
-        lyrics = await fetch_lyrics(title, artist)
-        if not lyrics:
-            print(f"[LYRICS] none found for {title} — {artist}", flush=True)
-            if thread:
-                try:
-                    await thread.delete()
-                except Exception as e:
-                    if DEBUG: print(f"[DEBUG] lyrics thread delete failed: {e}", flush=True)
-            channel = await get_text_channel()
-            if channel:
-                await channel.send(f"🎵 Couldn't find lyrics for {title}.")
-            return
+        t0 = time.time()
+        sentiment_line = await ask_llm_sentiment(title, artist, playlist_name)
+        elapsed = time.time() - t0
+        print(f"[{current_persona.upper()}] sentiment generated in {elapsed:.2f}s: {sentiment_line}", flush=True)
+    except Exception as e:
+        print(f"[SENTIMENT] [{title}] sentiment generation failed: {e}", flush=True)
+        traceback.print_exc()
 
-        channel = await get_text_channel()
-        if not thread and not channel:
-            return
+    # 3. Build embed WITHOUT the one-liner (description = base_desc; large image preserved)
+    if base_desc is None and getattr(message, "embeds", None):
+        base_desc = message.embeds[0].description or ""
 
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.description = base_desc
+    if video_id:
+        embed.set_image(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+    elif getattr(message, "embeds", None) and message.embeds[0].image and message.embeds[0].image.url:
+        embed.set_image(url=message.embeds[0].image.url)
+
+    # 4. First edit: content=(sentiment_line or ""), embed=embed
+    msg_id = getattr(message, "id", None)
+    try:
+        print(f"[SENTIMENT] [{title}] editing message id={msg_id}...", flush=True)
+        await message.edit(content=(sentiment_line or ""), embed=embed)
+        print(f"[SENTIMENT] [{title}] message id={msg_id} edit SUCCESS: sentiment content set.", flush=True)
+    except Exception as e:
+        print(f"[SENTIMENT] [{title}] message id={msg_id} edit FAILED: {e}", flush=True)
+        traceback.print_exc()
+
+    # 5. Await lyrics fetch
+    lyrics = None
+    try:
+        lyrics = await lyrics_task
+    except Exception as e:
+        if DEBUG: print(f"[DEBUG] lyrics fetch task failed: {e}", flush=True)
+        lyrics = None
+
+    # 6. Handle lyrics result
+    if lyrics:
         desc = lyrics
         if len(desc) > 4000:
             target_limit = 4000 - 2
@@ -1100,54 +1130,42 @@ async def post_lyrics(title: str, artist: str, thread=None):
             else:
                 desc = desc[:target_limit].rstrip() + "…"
 
-        embed = discord.Embed(
+        lyrics_embed = discord.Embed(
             title=f"📜 Lyrics — {title} — {artist}",
             description=desc,
             color=discord.Color.blurple()
         )
+        sent_to_thread = False
         if thread:
             try:
-                await thread.send(embed=embed)
-                return
+                await thread.send(embed=lyrics_embed)
+                sent_to_thread = True
             except Exception as te:
-                if DEBUG: print(f"[DEBUG] post_lyrics thread send failed, falling back to channel: {te}", flush=True)
+                if DEBUG: print(f"[DEBUG] lyrics thread send failed, falling back to channel: {te}", flush=True)
 
-        if channel:
-            await channel.send(embed=embed)
-    except Exception as e:
-        if DEBUG: print(f"[DEBUG] post_lyrics error: {e}", flush=True)
+        if not sent_to_thread:
+            channel = await get_text_channel()
+            if channel:
+                try:
+                    await channel.send(embed=lyrics_embed)
+                except Exception as ce:
+                    if DEBUG: print(f"[DEBUG] lyrics channel send failed: {ce}", flush=True)
+    else:
+        print(f"[LYRICS] none found for {title} — {artist}", flush=True)
+        if thread:
+            try:
+                await thread.delete()
+            except Exception as e:
+                if DEBUG: print(f"[DEBUG] lyrics thread delete failed: {e}", flush=True)
 
-async def _append_sentiment(message, base_desc, title, artist, playlist_name, video_id=None):
-    # Runs independently of the now-playing embed; failures here never affect it.
-    try:
-        t0 = time.time()
-        sentiment_line = await ask_llm_sentiment(title, artist, playlist_name)
-        elapsed = time.time() - t0
-        print(f"[{current_persona.upper()}] sentiment generated in {elapsed:.2f}s: {sentiment_line}", flush=True)
-
-        if message is None:
-            print(f"[SENTIMENT] [{title}] message is None, skipping edit.", flush=True)
-            return
-        if not sentiment_line:
-            print(f"[SENTIMENT] [{title}] no sentiment generated, skipping edit.", flush=True)
-            return
-
-        msg_id = getattr(message, "id", None)
-        print(f"[SENTIMENT] [{title}] editing message id={msg_id}...", flush=True)
-
-        embed = discord.Embed(color=discord.Color.blurple())
-        embed.description = f"{base_desc}\n{sentiment_line}"
-        if video_id:
-            embed.set_image(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
-        elif getattr(message, "embeds", None) and message.embeds[0].image and message.embeds[0].image.url:
-            embed.set_image(url=message.embeds[0].image.url)
-
-        await message.edit(embed=embed)
-        print(f"[SENTIMENT] [{title}] message id={msg_id} edit SUCCESS: sentiment appended.", flush=True)
-    except Exception as e:
-        msg_id = getattr(message, "id", None) if message else None
-        print(f"[SENTIMENT] [{title}] message id={msg_id} edit FAILED: {e}", flush=True)
-        traceback.print_exc()
+        new_content = (sentiment_line + " · 🎵 no lyrics found") if sentiment_line else "🎵 no lyrics found"
+        try:
+            print(f"[LYRICS] [{title}] editing message id={msg_id} with miss indicator...", flush=True)
+            await message.edit(content=new_content)
+            print(f"[LYRICS] [{title}] message id={msg_id} edit SUCCESS: miss indicator appended.", flush=True)
+        except Exception as e:
+            print(f"[LYRICS] [{title}] message id={msg_id} edit FAILED: {e}", flush=True)
+            traceback.print_exc()
 
 async def announce_track_start(title, artist, url, video_id):
     global current_persona, walk_state
@@ -1177,17 +1195,15 @@ async def announce_track_start(title, artist, url, video_id):
         except Exception as e:
             if DEBUG: print(f"[DEBUG] now-playing embed send failed: {e}", flush=True)
     
-    thread = None
     if message:
+        thread = None
         try:
             thread = await message.create_thread(name=f"Lyrics: {title}"[:90], auto_archive_duration=60)
         except Exception as e:
             if DEBUG: print(f"[DEBUG] lyrics create_thread failed: {e}", flush=True)
             thread = None
 
-    asyncio.create_task(post_lyrics(title, artist, thread=thread))
-    # One-liner arrives later via edit; never blocks or prevents the embed.
-    asyncio.create_task(_append_sentiment(message, base_desc, title, artist, playlist_name, video_id=video_id))
+        asyncio.create_task(_finalize_now_playing(message, thread, title, artist, playlist_name, video_id, base_desc=base_desc))
 
 async def handle_back_command(channel=None, ctx=None):
     global walk_state, pick_gen, playback_intent
