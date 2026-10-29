@@ -924,20 +924,23 @@ async def advance_walk(trigger="keep_ahead", gen_id=0):
         await re_roll_walk(gen_id=gen_id)
         return
 
-    start_idx = (walk_state["index"] + 1) % len(tracks)
+    start_idx = (walk_state.get("index", 0) + 1) % len(tracks)
     track = None
+    chosen_idx = start_idx
     for i in range(len(tracks)):
         idx = (start_idx + i) % len(tracks)
         candidate = tracks[idx]
         vid = candidate.get("video_id")
         if not vid or vid not in recent_played_vids:
             track = candidate
-            walk_state["index"] = idx
+            chosen_idx = idx
             break
             
     if not track:
         track = tracks[start_idx]
-        walk_state["index"] = start_idx
+        chosen_idx = start_idx
+
+    walk_state["queued_index"] = chosen_idx
 
     if pick_gen != gen_id: return
     await send_bridge_cmd({
@@ -1115,6 +1118,45 @@ async def announce_track_start(title, artist, url, video_id):
     # One-liner arrives later via edit; never blocks or prevents the embed.
     asyncio.create_task(_append_sentiment(message, base_desc, title, artist, playlist_name))
 
+async def handle_back_command(channel=None, ctx=None):
+    global walk_state, pick_gen, playback_intent
+    tracks = walk_state.get("tracks", [])
+    if not tracks:
+        msg = "Nothing before this."
+        if ctx:
+            await ctx.followup.send(f"❌ {msg}")
+        else:
+            asyncio.create_task(speak(msg))
+            if channel:
+                await channel.send(f"❌ {msg}")
+        return False
+
+    current_idx = walk_state.get("index", 0)
+    prev_idx = (current_idx - 1) % len(tracks)
+    walk_state["index"] = prev_idx
+    prev_track = tracks[prev_idx]
+
+    playback_intent = "playing"
+    pick_gen += 1
+
+    await send_bridge_cmd({"cmd": "stop"})
+    await send_bridge_cmd({
+        "cmd": "queue",
+        "url": prev_track["url"],
+        "title": prev_track["title"],
+        "artist": prev_track["artist"],
+        "video_id": prev_track.get("video_id")
+    })
+    log_pick("back", walk_state.get("query", ""), walk_state.get("source", "ytmusic"), walk_state.get("playlist_name", ""), prev_track["title"], prev_track["artist"], prev_track.get("video_id"))
+
+    if ctx:
+        await ctx.followup.send("Going back to previous track ⏪")
+    else:
+        asyncio.create_task(speak("Going back."))
+        if channel:
+            await channel.send("⏪ Playing previous track.")
+    return True
+
 # Voice Command Parser
 async def handle_voice_command(text, user_id):
     global current_persona, pick_gen, playback_intent
@@ -1135,14 +1177,7 @@ async def handle_voice_command(text, user_id):
         return
 
     if re.search(r'^(back|previous)\b', clean_norm, re.IGNORECASE):
-        playback_intent = "playing"
-        res = await send_bridge_cmd({"cmd": "back"}, wait_for_reply=True)
-        if res and res.get("event") == "error":
-            asyncio.create_task(speak("Nothing before this."))
-            if channel: await channel.send(f"❌ {res.get('message', 'Nothing before this.')}")
-        else:
-            asyncio.create_task(speak("Going back."))
-            if channel: await channel.send("⏪ Playing previous track.")
+        await handle_back_command(channel=channel)
         return
 
     if re.search(r'^pause\b', clean_norm, re.IGNORECASE):
@@ -1276,7 +1311,7 @@ class UserAudioBuffer:
 
 def do_transcribe(audio_np):
     try:
-        segments, info = stt_model.transcribe(audio_np, beam_size=5, language=SPOKEN_LANGUAGE)
+        segments, info = stt_model.transcribe(audio_np, beam_size=1, language=SPOKEN_LANGUAGE, initial_prompt="Echo")
         text = " ".join(segment.text for segment in segments if segment.no_speech_prob < 0.5).strip()
         return text
     except: return ""
@@ -1365,6 +1400,13 @@ async def handle_bridge_client(reader, writer):
                         elif player_state != "playing":
                             pick_gen += 1
                             asyncio.create_task(advance_walk(trigger="queue_empty", gen_id=pick_gen))
+                    elif evt == "queue_ack":
+                        status = header.get("status")
+                        reason = header.get("reason", "")
+                        if status == "rejected":
+                            print(f"[BRIDGE] Queue rejected track: {reason}", flush=True)
+                        elif DEBUG:
+                            print(f"[DEBUG] Bridge queue ack: ok", flush=True)
                     continue
 
                 user_id = int(header["u"])
@@ -1472,12 +1514,8 @@ async def skip(ctx):
 
 @bot.slash_command(name="back", description="Play previous track")
 async def back(ctx):
-    global playback_intent
     await ctx.defer()
-    playback_intent = "playing"
-    res = await send_bridge_cmd({"cmd": "back"}, wait_for_reply=True)
-    if res and res.get("event") == "error": await ctx.followup.send(f"❌ {res.get('message')}")
-    else: await ctx.followup.send("Going back to previous track ⏪")
+    await handle_back_command(ctx=ctx)
 
 @bot.slash_command(name="pause", description="Pause playback")
 async def pause(ctx):
@@ -1576,6 +1614,12 @@ async def command_file_watcher():
                         await join(ctx=None)
                     elif content == "leave":
                         await leave(ctx=None)
+                    elif content.startswith("queue "):
+                        url = content[6:].strip()
+                        await send_bridge_cmd({"cmd": "queue", "url": url, "title": "Test Track", "artist": "Test Artist", "video_id": "test_vid"})
+                    elif content.startswith("direct_playlist "):
+                        url = content[16:].strip()
+                        await handle_direct_playlist(url)
                     elif content.startswith("Echo") or content.startswith("echo") or content.startswith("hey echo"):
                         await handle_voice_command(content, 0)
         except Exception as e:

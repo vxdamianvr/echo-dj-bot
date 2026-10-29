@@ -6,7 +6,7 @@ const dotenv = require('dotenv');
 const path = require('path');
 const fs = require('fs');
 const { Transform } = require('stream');
-const { exec } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
@@ -32,11 +32,20 @@ const stats = {};
 const decoderStats = {};
 
 let audioQueue = [];
-let playHistory = [];
 let currentTrack = null;
+let currentStreamProcess = null;
 let hasEmittedQueueEmpty = true;
 let isCommandTransition = false;
 let trackStartTime = 0;
+
+function killStreamProcess() {
+    if (currentStreamProcess) {
+        try {
+            currentStreamProcess.kill();
+        } catch (e) {}
+        currentStreamProcess = null;
+    }
+}
 
 const player = createAudioPlayer({
     behaviors: {
@@ -67,7 +76,7 @@ function prefetchNext() {
     
     nextTrack.isDownloading = true;
     const tmpFile = path.join(tempDir, `track_${Date.now()}`);
-    exec(`yt-dlp -f bestaudio -o "${tmpFile}" "${nextTrack.url}"`, (err, stdout, stderr) => {
+    execFile('yt-dlp', ['--no-playlist', '-f', 'bestaudio', '-o', tmpFile, nextTrack.url], (err, stdout, stderr) => {
         if (!err && fs.existsSync(tmpFile)) {
             nextTrack.localFile = tmpFile;
             if (DEBUG) console.log(`[DEBUG] Prefetched: ${nextTrack.title}`);
@@ -82,6 +91,7 @@ function prefetchNext() {
 function playNext(wasCommand = false, lastDuration = 0) {
     if (audioQueue.length === 0) {
         currentTrack = null;
+        killStreamProcess();
         if (!hasEmittedQueueEmpty && !wasCommand) {
             hasEmittedQueueEmpty = true;
             if (DEBUG) console.log(`[DEBUG] Queue empty, emitting queue_empty event. Last duration: ${lastDuration}s`);
@@ -108,22 +118,48 @@ function playNext(wasCommand = false, lastDuration = 0) {
 
     if (track.localFile && fs.existsSync(track.localFile)) {
         if (DEBUG) console.log(`[DEBUG] Playing from prefetched file: ${track.localFile}`);
+        killStreamProcess();
         startLocalPlayback(track.localFile);
         prefetchNext();
     } else {
-        if (DEBUG) console.log(`[DEBUG] Not prefetched. Downloading synchronously: ${track.title}`);
-        const tmpFile = path.join(tempDir, `play_${Date.now()}`);
-        exec(`yt-dlp -f bestaudio -o "${tmpFile}" "${track.url}"`, (error, stdout, stderr) => {
-            if (error || !fs.existsSync(tmpFile)) {
-                console.warn('[WARNING] yt-dlp download failed:', stderr);
-                isCommandTransition = true; // don't count as premature failure for backoff
-                player.stop(true);
-                return;
-            }
-            track.localFile = tmpFile;
-            startLocalPlayback(tmpFile);
-            prefetchNext();
+        if (DEBUG) console.log(`[DEBUG] Not prefetched. Streaming with yt-dlp: ${track.title}`);
+        killStreamProcess();
+
+        const child = spawn('yt-dlp', ['--no-playlist', '-f', 'bestaudio', '-o', '-', track.url], {
+            stdio: ['ignore', 'pipe', 'pipe']
         });
+        currentStreamProcess = child;
+
+        child.on('error', (err) => {
+            console.warn('[WARNING] yt-dlp stream spawn error:', err);
+            isCommandTransition = true;
+            killStreamProcess();
+            player.stop(true);
+        });
+
+        child.stderr.on('data', (d) => {
+            if (DEBUG) console.log(`[DEBUG yt-dlp stderr] ${d.toString().trim()}`);
+        });
+
+        const resource = createAudioResource(child.stdout);
+        resource.playStream.on('error', (err) => {
+            console.warn('[WARNING] Audio resource stream error:', err);
+            isCommandTransition = true;
+            killStreamProcess();
+            player.stop(true);
+        });
+
+        if (currentTrack) {
+            tcpClient.write(JSON.stringify({
+                event: 'track_start',
+                title: currentTrack.title,
+                artist: currentTrack.artist,
+                url: currentTrack.url || '',
+                video_id: currentTrack.video_id || null
+            }) + '\n');
+        }
+        player.play(resource);
+        prefetchNext();
     }
 }
 
@@ -153,10 +189,7 @@ player.on(AudioPlayerStatus.Idle, () => {
     
     if (DEBUG) console.log(`[DEBUG] AudioPlayer transitioned to Idle. Played for ${playDuration.toFixed(2)}s. isCommandTransition: ${isCommandTransition}`);
     
-    if (!isCommandTransition && currentTrack) {
-        playHistory.push(currentTrack);
-        if (playHistory.length > 20) playHistory.shift();
-    }
+    killStreamProcess();
     
     let allowGaplessRefill = true;
     if (!isCommandTransition && currentTrack && playDuration < 30) {
@@ -184,6 +217,7 @@ player.on(AudioPlayerStatus.Idle, () => {
 player.on('error', (error) => {
     const playDuration = (Date.now() - trackStartTime) / 1000;
     console.warn(`[WARNING] AudioPlayer Error after ${playDuration.toFixed(2)}s: ${error.message}`);
+    killStreamProcess();
     isCommandTransition = true;
     player.stop(true);
 });
@@ -237,19 +271,19 @@ tcpClient.on('data', (chunk) => {
         try {
             const msg = JSON.parse(line);
             if (msg.cmd === 'queue') {
-                const msgTitleNorm = msg.title.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
-                const normalize = t => t.title.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
-                const dupQueue = audioQueue.find(t => t.url === msg.url || normalize(t) === msgTitleNorm);
-                const dupCurrent = currentTrack && (currentTrack.url === msg.url || normalize(currentTrack) === msgTitleNorm);
-                const dupHistory = playHistory.find(t => t.url === msg.url || normalize(t) === msgTitleNorm);
-                
-                if (dupQueue || dupCurrent || dupHistory) {
-                    if (DEBUG) console.log(`[DEBUG] Dropping duplicate track from queue add: ${msg.title}`);
+                if (!msg.url || typeof msg.url !== 'string' || !msg.url.trim()) {
+                    if (DEBUG) console.log(`[DEBUG] Rejecting queue cmd: missing or invalid url`);
+                    if (msg.uuid) {
+                        tcpClient.write(JSON.stringify({ event: 'queue_ack', status: 'rejected', reason: 'invalid_url', uuid: msg.uuid }) + '\n');
+                    }
                     continue;
                 }
                 
                 if (DEBUG) console.log(`[DEBUG] Received queue cmd: ${msg.title}`);
                 audioQueue.push({ url: msg.url, title: msg.title, artist: msg.artist, video_id: msg.video_id || null });
+                if (msg.uuid) {
+                    tcpClient.write(JSON.stringify({ event: 'queue_ack', status: 'ok', uuid: msg.uuid }) + '\n');
+                }
                 
                 if (player.state.status === AudioPlayerStatus.Idle) {
                     playNext(0);
@@ -260,30 +294,14 @@ tcpClient.on('data', (chunk) => {
                 if (DEBUG) console.log('[DEBUG] Received skip cmd');
                 isCommandTransition = true;
                 hasEmittedQueueEmpty = false;
+                killStreamProcess();
                 player.stop(); 
 
 
             } else if (msg.cmd === 'back') {
-                if (DEBUG) console.log('[DEBUG] Received back cmd');
-                if (playHistory.length === 0) {
-                    if (msg.uuid) {
-                        tcpClient.write(JSON.stringify({ event: 'error', message: 'nothing before this', uuid: msg.uuid }) + '\n');
-                    }
-                } else {
-                    isCommandTransition = true; 
-                    if (currentTrack) {
-                        currentTrack.localFile = null; // force redownload if needed
-                        currentTrack.isDownloading = false;
-                        audioQueue.unshift(currentTrack);
-                    }
-                    const prev = playHistory.pop();
-                    prev.localFile = null;
-                    prev.isDownloading = false;
-                    audioQueue.unshift(prev);
-                    player.stop(true); 
-                    if (msg.uuid) {
-                        tcpClient.write(JSON.stringify({ event: 'success', uuid: msg.uuid }) + '\n');
-                    }
+                if (DEBUG) console.log('[DEBUG] Received back cmd (handled by Python)');
+                if (msg.uuid) {
+                    tcpClient.write(JSON.stringify({ event: 'error', message: 'back is handled by Python', uuid: msg.uuid }) + '\n');
                 }
             } else if (msg.cmd === 'pause') {
                 if (DEBUG) console.log('[DEBUG] Received pause cmd');
@@ -295,6 +313,7 @@ tcpClient.on('data', (chunk) => {
             } else if (msg.cmd === 'stop') {
                 if (DEBUG) console.log('[DEBUG] Received stop cmd');
                 isCommandTransition = true;
+                killStreamProcess();
                 audioQueue = [];
                 duckingPause = false;
                 player.stop(true);
@@ -305,7 +324,7 @@ tcpClient.on('data', (chunk) => {
                     playing: currentTrack ? { title: currentTrack.title, artist: currentTrack.artist } : null,
                     paused: player.state.status === AudioPlayerStatus.Paused || player.state.status === AudioPlayerStatus.AutoPaused,
                     up_next: audioQueue.slice(0, 10).map(t => ({ title: t.title, artist: t.artist })),
-                    history_count: playHistory.length,
+                    history_count: 0,
                     uuid: msg.uuid
                 };
                 tcpClient.write(JSON.stringify(resp) + '\n');
@@ -359,9 +378,13 @@ class Downsampler extends Transform {
 
         for (let i = 0; i < numTriplets; i++) {
             const offset = i * 12;
-            const left = this.buffer.readInt16LE(offset);
-            const right = this.buffer.readInt16LE(offset + 2);
-            const mono = Math.floor((left + right) / 2);
+            const l0 = this.buffer.readInt16LE(offset);
+            const r0 = this.buffer.readInt16LE(offset + 2);
+            const l1 = this.buffer.readInt16LE(offset + 4);
+            const r1 = this.buffer.readInt16LE(offset + 6);
+            const l2 = this.buffer.readInt16LE(offset + 8);
+            const r2 = this.buffer.readInt16LE(offset + 10);
+            const mono = Math.max(-32768, Math.min(32767, Math.floor((l0 + r0 + l1 + r1 + l2 + r2) / 6)));
             outBuffer.writeInt16LE(mono, i * 2);
         }
 
