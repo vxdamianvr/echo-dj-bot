@@ -920,8 +920,7 @@ async def advance_walk(trigger="keep_ahead", gen_id=0):
         await re_roll_walk(gen_id=gen_id)
         return
 
-    walk_state["tracks_played"] = walk_state.get("tracks_played", 0) + 1
-    if walk_state["tracks_played"] >= walk_state.get("max_tracks", 12):
+    if walk_state.get("tracks_played", 0) >= walk_state.get("max_tracks", 12):
         await re_roll_walk(gen_id=gen_id)
         return
 
