@@ -880,6 +880,9 @@ async def post_lyrics(title: str, artist: str):
         lyrics = await fetch_lyrics(title, artist)
         if not lyrics:
             print(f"[LYRICS] none found for {title} — {artist}", flush=True)
+            channel = bot.get_channel(TEXT_CHANNEL_ID)
+            if channel:
+                await channel.send(f"🎵 Couldn't find lyrics for {title}.")
             return
 
         channel = bot.get_channel(TEXT_CHANNEL_ID)
@@ -904,30 +907,48 @@ async def post_lyrics(title: str, artist: str):
     except Exception as e:
         if DEBUG: print(f"[DEBUG] post_lyrics error: {e}", flush=True)
 
+async def _append_sentiment(message, base_desc, title, artist, playlist_name):
+    # Runs independently of the now-playing embed; failures here never affect it.
+    try:
+        sentiment_line = await ask_llm_sentiment(title, artist, playlist_name)
+        print(f"[{current_persona.upper()}] {sentiment_line}", flush=True)
+        if message is None or not sentiment_line:
+            return
+        embed = discord.Embed(color=discord.Color.blurple())
+        embed.description = f"{base_desc}\n{sentiment_line}"
+        await message.edit(embed=embed)
+    except Exception as e:
+        if DEBUG: print(f"[DEBUG] sentiment append failed: {e}", flush=True)
+
 async def announce_track_start(title, artist, url, video_id):
     global current_persona, walk_state
     
-    asyncio.create_task(post_lyrics(title, artist))
-    
+    # Snapshot walk state synchronously so the embed reflects this track.
     playlist_name = walk_state.get("playlist_name") or "Curated"
-    sentiment_line = await ask_llm_sentiment(title, artist, playlist_name)
-    print(f"[{current_persona.upper()}] {sentiment_line}", flush=True)
-    
     track_idx = walk_state.get("tracks_played", 1)
     total_tracks = len(walk_state.get("tracks", []))
     track_meta = f"track {track_idx}/{total_tracks}" if total_tracks > 1 else "track 1/1"
     
     song_url = url if url else f"https://youtube.com/watch?v={video_id}"
+    base_desc = (
+        f"Now playing: [{title} — {artist}]({song_url})\n"
+        f'via "{playlist_name}" · {track_meta}'
+    )
     
+    # Now-playing embed is time-critical: send it first, before any LLM work.
+    message = None
     channel = bot.get_channel(TEXT_CHANNEL_ID)
     if channel:
-        embed = discord.Embed(color=discord.Color.blurple())
-        embed.description = (
-            f"Now playing: [{title} — {artist}]({song_url})\n"
-            f'via "{playlist_name}" · {track_meta}\n'
-            f"{sentiment_line}"
-        )
-        await channel.send(embed=embed)
+        try:
+            embed = discord.Embed(color=discord.Color.blurple())
+            embed.description = base_desc
+            message = await channel.send(embed=embed)
+        except Exception as e:
+            if DEBUG: print(f"[DEBUG] now-playing embed send failed: {e}", flush=True)
+    
+    asyncio.create_task(post_lyrics(title, artist))
+    # One-liner arrives later via edit; never blocks or prevents the embed.
+    asyncio.create_task(_append_sentiment(message, base_desc, title, artist, playlist_name))
 
 # Voice Command Parser
 async def handle_voice_command(text, user_id):
