@@ -97,7 +97,7 @@ async def test_e1_persona_picker_and_switch():
         print("  [PASS] /persona command: retired previous picker, returned fresh picker")
 
 async def test_e2_e4_embed_thumbnail_and_sentiment_append():
-    print("--- Testing E2 & E4: Embed Thumbnail & Sentiment Append ---")
+    print("--- Testing E2 & E4 & F1: Embed Image & Sentiment Append ---")
     mock_channel = MagicMock()
     mock_message = MagicMock()
     mock_message.id = 2001
@@ -115,15 +115,26 @@ async def test_e2_e4_embed_thumbnail_and_sentiment_append():
             mock_channel.send.assert_awaited_once()
             _, kwargs = mock_channel.send.call_args
             embed = kwargs['embed']
-            assert embed.thumbnail.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Thumbnail should match YT video_id"
+            assert embed.image.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Image should match YT video_id"
             assert "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)" in embed.description
-            print("  [PASS] E2: Thumbnail set correctly on now-playing embed")
+            print("  [PASS] F1: Large image set correctly on now-playing embed")
 
             # Check thread created and passed
             mock_message.create_thread.assert_awaited_once_with(name="Lyrics: Test Song", auto_archive_duration=60)
             mock_post_lyrics.assert_called_once()
             mock_append_sentiment.assert_called_once()
             print("  [PASS] E3: Lyrics thread created under message and passed to post_lyrics")
+
+        # Test announce_track_start without video_id (no image)
+        mock_channel.send.reset_mock()
+        with patch.object(bot, 'post_lyrics', AsyncMock()), \
+             patch.object(bot, '_append_sentiment', AsyncMock()):
+            await bot.announce_track_start("No Vid Song", "Artist", "https://example.com/audio.mp3", None)
+            mock_channel.send.assert_awaited_once()
+            _, no_vid_kwargs = mock_channel.send.call_args
+            no_vid_embed = no_vid_kwargs['embed']
+            assert no_vid_embed.image is None or no_vid_embed.image.url is None, "No image when video_id is absent"
+            print("  [PASS] F1: No image set when video_id is absent")
 
         # Test _append_sentiment
         base_desc = "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)\nvia \"Curated\" · track 1/1"
@@ -138,9 +149,9 @@ async def test_e2_e4_embed_thumbnail_and_sentiment_append():
             assert lines[0] == "Now playing: [Test Song — Test Artist](https://youtube.com/watch?v=vid123)"
             assert lines[1] == 'via "Curated" · track 1/1'
             assert lines[2] == "Certified banger."
-            # Verify thumbnail was NOT wiped
-            assert edited_embed.thumbnail.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Thumbnail must be preserved after edit"
-            print("  [PASS] E4: Sentiment appended as 3rd line and thumbnail preserved")
+            # Verify large image was NOT wiped
+            assert edited_embed.image.url == "https://i.ytimg.com/vi/vid123/hqdefault.jpg", "Large image must be preserved after edit"
+            print("  [PASS] F1 & E4: Sentiment appended as 3rd line and large image preserved")
 
 async def test_e3_lyrics_threading_and_miss_handling():
     print("--- Testing E3: Lyrics Threading & Miss Handling ---")

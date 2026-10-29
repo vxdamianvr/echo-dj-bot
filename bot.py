@@ -1138,9 +1138,9 @@ async def _append_sentiment(message, base_desc, title, artist, playlist_name, vi
         embed = discord.Embed(color=discord.Color.blurple())
         embed.description = f"{base_desc}\n{sentiment_line}"
         if video_id:
-            embed.set_thumbnail(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
-        elif getattr(message, "embeds", None) and message.embeds[0].thumbnail and message.embeds[0].thumbnail.url:
-            embed.set_thumbnail(url=message.embeds[0].thumbnail.url)
+            embed.set_image(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+        elif getattr(message, "embeds", None) and message.embeds[0].image and message.embeds[0].image.url:
+            embed.set_image(url=message.embeds[0].image.url)
 
         await message.edit(embed=embed)
         print(f"[SENTIMENT] [{title}] message id={msg_id} edit SUCCESS: sentiment appended.", flush=True)
@@ -1172,7 +1172,7 @@ async def announce_track_start(title, artist, url, video_id):
             embed = discord.Embed(color=discord.Color.blurple())
             embed.description = base_desc
             if video_id:
-                embed.set_thumbnail(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+                embed.set_image(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
             message = await channel.send(embed=embed)
         except Exception as e:
             if DEBUG: print(f"[DEBUG] now-playing embed send failed: {e}", flush=True)
