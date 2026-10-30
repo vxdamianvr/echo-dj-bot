@@ -3,7 +3,7 @@ import sys
 
 # Cap intra-op threads to 2 to prevent TTS CPU spikes starving audio encoding
 os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
+# ORT_INTRA_OP_NUM_THREADS is not a real onnxruntime variable
 
 import json
 import time
@@ -38,10 +38,25 @@ from discord.ext import commands
 from faster_whisper import WhisperModel
 from ytmusicapi import YTMusic
 from kokoro_onnx import Kokoro
+import onnxruntime as ort
 import soundfile as sf
 
 load_dotenv()
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+def make_inference_session_wrapper(real_session):
+    def _inference_session_wrapper(*args, **kwargs):
+        sess_options = kwargs.get("sess_options")
+        if sess_options is None:
+            sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 2
+        sess_options.inter_op_num_threads = 1
+        kwargs["sess_options"] = sess_options
+        return real_session(*args, **kwargs)
+    return _inference_session_wrapper
+
+_real_inference_session = None
+_inference_session_wrapper = None
 
 yt = YTMusic()
 kokoro = None
@@ -49,14 +64,20 @@ try:
     if os.path.exists("models/kokoro-v1.0.onnx") and os.path.exists("models/voices-v1.0.bin"):
         sig = inspect.signature(Kokoro.__init__)
         if "session_options" in sig.parameters:
-            import onnxruntime as ort
             sess_options = ort.SessionOptions()
             sess_options.intra_op_num_threads = 2
+            sess_options.inter_op_num_threads = 1
             kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin", session_options=sess_options)
-            print("[TTS] Kokoro initialized with SessionOptions(intra_op_num_threads=2)")
+            print("[TTS] Kokoro initialized with SessionOptions(intra_op_num_threads=2, inter_op_num_threads=1)")
         else:
-            kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
-            print("[TTS] Kokoro constructor does not accept session_options; capped ONNX threads via OMP_NUM_THREADS=2 and ORT_INTRA_OP_NUM_THREADS=2")
+            _real_inference_session = ort.InferenceSession
+            _inference_session_wrapper = make_inference_session_wrapper(_real_inference_session)
+            ort.InferenceSession = _inference_session_wrapper
+            try:
+                kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
+            finally:
+                ort.InferenceSession = _real_inference_session
+            print("[TTS] Injected SessionOptions(intra_op_num_threads=2, inter_op_num_threads=1) via temporary InferenceSession wrapper")
         old_run = kokoro.sess.run
         def new_run(output_names, input_feed, run_options=None):
             if "speed" in input_feed and input_feed["speed"].dtype == np.int32:

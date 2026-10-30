@@ -111,8 +111,53 @@ def test_tts_serialization():
             
     asyncio.run(async_test())
 
+def test_onnx_thread_cap_wrapper():
+    print("--- Test 4: ONNX SessionOptions injection wrapper ---")
+    import onnxruntime as ort
+    
+    recorded_calls = []
+    def recording_fake(*args, **kwargs):
+        recorded_calls.append((args, kwargs))
+        mock_sess = MagicMock()
+        return mock_sess
+
+    orig_session = ort.InferenceSession
+    wrapper = bot.make_inference_session_wrapper(recording_fake)
+    ort.InferenceSession = wrapper
+    try:
+        # invoke it the way Kokoro.__init__ does:
+        # (model path positionally, providers=["CPUExecutionProvider"] as kwarg)
+        res = ort.InferenceSession("models/kokoro-v1.0.onnx", providers=["CPUExecutionProvider"])
+    finally:
+        ort.InferenceSession = orig_session
+
+    assert ort.InferenceSession is orig_session, "ort.InferenceSession must be restored to original"
+    assert len(recorded_calls) == 1, "Expected 1 call to recording fake"
+    args, kwargs = recorded_calls[0]
+    assert args == ("models/kokoro-v1.0.onnx",), f"Expected positional args untouched, got {args}"
+    assert kwargs.get("providers") == ["CPUExecutionProvider"], f"Expected providers untouched, got {kwargs.get('providers')}"
+    
+    sess_opts = kwargs.get("sess_options")
+    assert sess_opts is not None, "Expected sess_options in kwargs"
+    assert sess_opts.intra_op_num_threads == 2, f"Expected intra_op_num_threads == 2, got {sess_opts.intra_op_num_threads}"
+    assert sess_opts.inter_op_num_threads == 1, f"Expected inter_op_num_threads == 1, got {sess_opts.inter_op_num_threads}"
+    
+    # Also test reusing existing sess_options passed by caller
+    custom_opts = ort.SessionOptions()
+    custom_opts.intra_op_num_threads = 99
+    custom_opts.inter_op_num_threads = 99
+    wrapper("models/kokoro-v1.0.onnx", sess_options=custom_opts, providers=["CPUExecutionProvider"])
+    assert len(recorded_calls) == 2
+    args2, kwargs2 = recorded_calls[1]
+    assert kwargs2["sess_options"] is custom_opts
+    assert custom_opts.intra_op_num_threads == 2
+    assert custom_opts.inter_op_num_threads == 1
+    
+    print("  [PASS] SessionOptions injected with intra=2, inter=1, providers preserved, InferenceSession restored")
+
 if __name__ == "__main__":
     test_resampling_sine()
     test_resampling_fallback()
     test_tts_serialization()
-    print("\nALL BRIEF T UNIT TESTS PASSED!")
+    test_onnx_thread_cap_wrapper()
+    print("\nALL BRIEF T & T2 UNIT TESTS PASSED!")
