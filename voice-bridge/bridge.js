@@ -331,6 +331,8 @@ tcpClient.on('data', (chunk) => {
             } else if (msg.cmd === 'speak') {
                 if (DEBUG) console.log('[DEBUG] Received speak cmd');
                 const pcmBytes = Buffer.from(msg.pcm_b64, 'base64');
+                const durationSec = (pcmBytes.length / 192000).toFixed(2);
+                console.log(`[TTS] Received speak audio: ${pcmBytes.length} bytes (~${durationSec}s)`);
                 const readable = new (require('stream').Readable)({
                     read() {
                         this.push(pcmBytes);

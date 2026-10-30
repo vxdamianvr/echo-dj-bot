@@ -1,11 +1,17 @@
 import os
 import sys
+
+# Cap intra-op threads to 2 to prevent TTS CPU spikes starving audio encoding
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["ORT_INTRA_OP_NUM_THREADS"] = "2"
+
 import json
 import time
 import asyncio
 import subprocess
 import traceback
 import logging
+import inspect
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -41,7 +47,16 @@ yt = YTMusic()
 kokoro = None
 try:
     if os.path.exists("models/kokoro-v1.0.onnx") and os.path.exists("models/voices-v1.0.bin"):
-        kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
+        sig = inspect.signature(Kokoro.__init__)
+        if "session_options" in sig.parameters:
+            import onnxruntime as ort
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = 2
+            kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin", session_options=sess_options)
+            print("[TTS] Kokoro initialized with SessionOptions(intra_op_num_threads=2)")
+        else:
+            kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
+            print("[TTS] Kokoro constructor does not accept session_options; capped ONNX threads via OMP_NUM_THREADS=2 and ORT_INTRA_OP_NUM_THREADS=2")
         old_run = kokoro.sess.run
         def new_run(output_names, input_feed, run_options=None):
             if "speed" in input_feed and input_feed["speed"].dtype == np.int32:
@@ -404,17 +419,49 @@ async def send_bridge_cmd(cmd_dict, wait_for_reply=False):
         print("[CRITICAL] Failed to send bridge cmd:", e)
         return None
 
+def resample_24k_to_48k(samples: np.ndarray, sr: int = 24000) -> np.ndarray:
+    if sr != 24000:
+        print(f"[TTS] WARNING: kokoro.create returned unexpected sample rate {sr} (expected 24000). Falling back to sample repetition.")
+        return np.repeat(samples, 2)
+    n = len(samples)
+    if n == 0:
+        return np.zeros(0, dtype=samples.dtype)
+    x_orig = np.arange(n)
+    x_new = np.arange(2 * n) * 0.5
+    return np.interp(x_new, x_orig, samples)
+
+tts_queue = asyncio.Queue()
+_tts_worker_task = None
+
+async def _tts_worker():
+    while True:
+        try:
+            text = await tts_queue.get()
+            if not TTS_ENABLED or not kokoro:
+                tts_queue.task_done()
+                continue
+            try:
+                samples, sr = await asyncio.to_thread(kokoro.create, text, voice=TTS_VOICE, speed=1.1, lang="en-gb")
+                upsampled = resample_24k_to_48k(samples, sr)
+                stereo = np.column_stack((upsampled, upsampled))
+                pcm_s16le = (stereo * 32767).astype(np.int16).tobytes()
+                pcm_b64 = base64.b64encode(pcm_s16le).decode('utf-8')
+                await send_bridge_cmd({"cmd": "speak", "pcm_b64": pcm_b64, "n": len(pcm_s16le)})
+                duration = len(upsampled) / 48000.0
+                await asyncio.sleep(duration)
+            except Exception as e:
+                print("[CRITICAL] TTS failed:", e)
+            finally:
+                tts_queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print("[CRITICAL] TTS worker error:", e)
+
 async def speak(text):
-    if not TTS_ENABLED or not kokoro: return
-    try:
-        samples, sr = await asyncio.to_thread(kokoro.create, text, voice=TTS_VOICE, speed=1.1, lang="en-gb")
-        upsampled = np.repeat(samples, 2)
-        stereo = np.column_stack((upsampled, upsampled))
-        pcm_s16le = (stereo * 32767).astype(np.int16).tobytes()
-        pcm_b64 = base64.b64encode(pcm_s16le).decode('utf-8')
-        await send_bridge_cmd({"cmd": "speak", "pcm_b64": pcm_b64, "n": len(pcm_s16le)})
-    except Exception as e:
-        print("[CRITICAL] TTS failed:", e)
+    if not TTS_ENABLED or not kokoro or not text:
+        return
+    await tts_queue.put(text)
 
 async def ask_llm(prompt, model=None, format=None):
     target_model = model if model else OLLAMA_MODEL
@@ -2210,6 +2257,9 @@ async def on_ready():
     get_stt_model()
     bot.loop.create_task(transcribe_worker())
     bot.loop.create_task(command_file_watcher())
+    global _tts_worker_task
+    if _tts_worker_task is None or _tts_worker_task.done():
+        _tts_worker_task = bot.loop.create_task(_tts_worker())
 
 if __name__ == "__main__":
     if not os.path.exists("logs"): os.makedirs("logs")
