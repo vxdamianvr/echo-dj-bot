@@ -1671,9 +1671,11 @@ async def join(ctx=None):
     if bridge_active:
         msg = "Already joined and listening via Node bridge! 🎧"
         if ctx:
+            await retire_picker_message()
             last_picker_message = await ctx.followup.send(msg, view=PersonaView())
             return last_picker_message
         elif channel:
+            await retire_picker_message()
             last_picker_message = await channel.send(msg, view=PersonaView())
             return last_picker_message
         return
@@ -1682,8 +1684,10 @@ async def join(ctx=None):
     if ok:
         msg = "Joined and listening via Node bridge! 🎧 Pick a persona:"
         if ctx:
+            await retire_picker_message()
             last_picker_message = await ctx.followup.send(msg, view=PersonaView())
         elif channel:
+            await retire_picker_message()
             last_picker_message = await channel.send(msg, view=PersonaView())
         if JOIN_AUTOPLAY:
             pick_gen += 1
@@ -1891,6 +1895,7 @@ async def on_message(message):
                 if not ok:
                     await message.reply("Couldn't join the voice channel — try /join.", mention_author=False)
                     return
+                await retire_picker_message()
                 msg_obj = await message.channel.send("Joined and listening via Node bridge! 🎧 Pick a persona:", view=PersonaView())
                 last_picker_message = msg_obj
                 await handle_voice_command(remainder, message.author.id)

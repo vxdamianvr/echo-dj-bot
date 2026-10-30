@@ -219,6 +219,86 @@ async def test_case_h_lyrics_in_sentiment_flag():
 
     bot.LYRICS_IN_SENTIMENT = True
 
+async def test_case_i_picker_invariant():
+    print("--- Test (i): Picker invariant: every join / auto-join retires previous picker ---")
+    
+    # 1. join(ctx) twice in a row: first picker message receives edit(view=None), last_picker_message is the second
+    bot.bridge_active = False
+    bot.last_picker_message = None
+    
+    mock_msg1 = MagicMock()
+    mock_msg1.edit = AsyncMock()
+    mock_msg2 = MagicMock()
+    mock_msg2.edit = AsyncMock()
+    
+    mock_ctx1 = MagicMock()
+    mock_ctx1.defer = AsyncMock()
+    mock_ctx1.followup.send = AsyncMock(return_value=mock_msg1)
+    
+    mock_ctx2 = MagicMock()
+    mock_ctx2.defer = AsyncMock()
+    mock_ctx2.followup.send = AsyncMock(return_value=mock_msg2)
+    
+    with patch.object(bot, 'ensure_voice_joined', AsyncMock(return_value=True)):
+        # First join
+        await bot.join(ctx=mock_ctx1)
+        assert bot.last_picker_message == mock_msg1
+        mock_msg1.edit.assert_not_called()
+        
+        # Second join (bridge_active is now simulated as True or False)
+        # Testing join() again:
+        await bot.join(ctx=mock_ctx2)
+        mock_msg1.edit.assert_awaited_once_with(view=None)
+        assert bot.last_picker_message == mock_msg2
+
+    # 2. join(ctx=None) via channel.send twice in a row
+    mock_ch_msg1 = MagicMock()
+    mock_ch_msg1.edit = AsyncMock()
+    mock_ch_msg2 = MagicMock()
+    mock_ch_msg2.edit = AsyncMock()
+    
+    mock_channel = MagicMock()
+    mock_channel.send = AsyncMock(side_effect=[mock_ch_msg1, mock_ch_msg2])
+    
+    bot.bridge_active = False
+    bot.last_picker_message = None
+    with patch.object(bot, 'get_text_channel', AsyncMock(return_value=mock_channel)), \
+         patch.object(bot, 'ensure_voice_joined', AsyncMock(return_value=True)):
+        await bot.join(ctx=None)
+        assert bot.last_picker_message == mock_ch_msg1
+        mock_ch_msg1.edit.assert_not_called()
+        
+        bot.bridge_active = True
+        await bot.join(ctx=None)
+        mock_ch_msg1.edit.assert_awaited_once_with(view=None)
+        assert bot.last_picker_message == mock_ch_msg2
+
+    # 3. Simulate the @Echo mention auto-join path with a stored picker
+    bot.bridge_active = False
+    prior_picker = MagicMock()
+    prior_picker.edit = AsyncMock()
+    bot.last_picker_message = prior_picker
+    
+    new_picker = MagicMock()
+    mock_mention_msg = MagicMock()
+    mock_mention_msg.author.bot = False
+    mock_mention_msg.author.id = 42
+    mock_mention_msg.channel.id = bot.TEXT_CHANNEL_ID
+    mock_mention_msg.channel.send = AsyncMock(side_effect=[MagicMock(), new_picker])
+    mock_mention_msg.content = "<@123456789> play jazz"
+
+    mock_user = MagicMock()
+    mock_user.mentioned_in = MagicMock(return_value=True)
+
+    with patch.object(bot.bot._connection, 'user', mock_user), \
+         patch.object(bot, 'ensure_voice_joined', AsyncMock(return_value=True)), \
+         patch.object(bot, 'handle_voice_command', AsyncMock()):
+        await bot.on_message(mock_mention_msg)
+        prior_picker.edit.assert_awaited_once_with(view=None)
+        assert bot.last_picker_message == new_picker
+
+    print("  [PASS] Test (i): All picker invariant paths retire previous picker properly")
+
 async def main():
     await test_case_a_mention_strip_and_parse()
     await test_case_b_bare_mention()
@@ -228,6 +308,7 @@ async def main():
     await test_case_f_not_in_voice_play()
     await test_case_g_lyrics_snippet_and_timeout()
     await test_case_h_lyrics_in_sentiment_flag()
+    await test_case_i_picker_invariant()
     print("\nALL J+K TESTS PASSED SUCCESSFULLY!")
 
 if __name__ == "__main__":
