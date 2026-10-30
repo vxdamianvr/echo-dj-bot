@@ -583,7 +583,8 @@ async def search_single_song(query, source="ytmusic"):
                 s = res[0]
                 vid = s.get("videoId")
                 title = s.get("title", "Unknown")
-                artist = s.get("artists")[0]["name"] if s.get("artists") else "Unknown"
+                artists_list = s.get("artists", [])
+                artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
                 url = f"https://youtube.com/watch?v={vid}"
                 return {"title": title, "artist": artist, "video_id": vid, "url": url, "duration": s.get("duration")}
         except: pass
@@ -791,7 +792,7 @@ async def handle_direct_playlist(url: str, ctx=None, channel=None):
     ))
 
 # Walk Engine
-async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=None, initial_start_index=None, prefetched_tracks=None, interrupt=True):
+async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=None, initial_start_index=None, prefetched_tracks=None, interrupt=True, pre_resolved_candidates=None):
     global walk_state, pick_gen, walk_in_flight
     if walk_in_flight:
         for _ in range(60):
@@ -842,7 +843,9 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
             chosen_playlist = None
             candidates = []
             
-            if source == "soundcloud":
+            if pre_resolved_candidates is not None:
+                candidates = pre_resolved_candidates
+            elif source == "soundcloud":
                 candidates = await resolve_playlist_soundcloud(query)
             else:
                 candidates = await resolve_playlist_ytmusic(query)
@@ -871,6 +874,7 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
                         "tracks_played": 1,
                         "max_tracks": 1,
                         "single_song": song,
+                        "mix_seed": None,
                         "explicit_playlist": None,
                         "started_ts": time.time()
                     }
@@ -911,6 +915,7 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
             "tracks_played": 0,
             "max_tracks": random.randint(10, 15),
             "single_song": None,
+            "mix_seed": None,
             "explicit_playlist": explicit_playlist,
             "started_ts": time.time()
         }
@@ -999,6 +1004,191 @@ async def advance_walk(trigger="keep_ahead", gen_id=0):
     })
     log_pick(trigger, walk_state.get("query", ""), walk_state.get("source", "ytmusic"), walk_state.get("playlist_name", ""), track["title"], track["artist"], track.get("video_id"))
 
+STOPWORDS = {"the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "from", "and", "or"}
+
+def is_strong_song_match(query: str, song: dict | None) -> bool:
+    if not song or not query:
+        return False
+    words = [w for w in re.findall(r'[a-zA-Z0-9]+', query.lower()) if w not in STOPWORDS]
+    if len(words) < 2:
+        return False
+    target = f"{song.get('title', '')} {song.get('artist', '')}".lower()
+    return all(w in target for w in words)
+
+async def start_song_route(song_res, query, source, gen_id):
+    global walk_state, pick_gen, walk_in_flight
+    if pick_gen != gen_id:
+        return
+
+    if walk_in_flight:
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if not walk_in_flight or pick_gen != gen_id:
+                break
+        if pick_gen != gen_id:
+            return
+        if walk_in_flight:
+            print(f"[WARN] start_song_route: previous walk still in flight, bailing", flush=True)
+            return
+
+    walk_in_flight = True
+    try:
+        song_track = dict(song_res)
+        song_track["via"] = "YT Music mix"
+
+        walk_state = {
+            "query": query,
+            "source": source,
+            "playlist_name": "YT Music mix",
+            "tracks": [song_track],
+            "index": 0,
+            "tracks_played": 0,
+            "max_tracks": 50,
+            "single_song": song_track,
+            "mix_seed": song_track,
+            "explicit_playlist": None,
+            "started_ts": time.time()
+        }
+
+        await send_bridge_cmd({"cmd": "stop"})
+        await send_bridge_cmd({
+            "cmd": "queue",
+            "url": song_track["url"],
+            "title": song_track["title"],
+            "artist": song_track["artist"],
+            "video_id": song_track.get("video_id")
+        })
+        log_pick("echo", query, source, "YT Music mix", song_track["title"], song_track["artist"], song_track.get("video_id"))
+    finally:
+        walk_in_flight = False
+
+async def fill_mix_queue(seed_track, gen_id):
+    global walk_state, pick_gen
+    seed_vid = seed_track.get("video_id")
+    if not seed_vid:
+        print("[MIX] Seed track has no video_id, cannot fetch mix", flush=True)
+        return
+
+    print(f"[MIX] Fetching watch playlist mix for seed: {seed_track.get('title')} ({seed_vid})", flush=True)
+    try:
+        res = await asyncio.to_thread(yt.get_watch_playlist, videoId=seed_vid, radio=True, limit=25)
+    except Exception as e:
+        print(f"[MIX] Error fetching watch playlist: {e}", flush=True)
+        res = None
+
+    if pick_gen != gen_id or not bridge_active:
+        print(f"[MIX] Generation changed ({pick_gen} != {gen_id}) or bridge inactive, discarding mix", flush=True)
+        return
+
+    raw_tracks = res.get("tracks", []) if res else []
+    surviving = []
+    seen_vids = {seed_vid}
+
+    for t in raw_tracks:
+        vid = t.get("videoId")
+        if not vid or vid in seen_vids:
+            continue
+        seen_vids.add(vid)
+        if vid in recent_played_vids:
+            continue
+
+        title = t.get("title", "Unknown")
+        artists_list = t.get("artists", [])
+        artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
+        surviving.append({
+            "title": title,
+            "artist": artist,
+            "video_id": vid,
+            "url": f"https://youtube.com/watch?v={vid}",
+            "duration": t.get("length") or t.get("duration"),
+            "via": "YT Music mix"
+        })
+
+    print(f"[MIX] Fetched {len(raw_tracks)} tracks, {len(surviving)} usable after filtering for seed {seed_vid}", flush=True)
+
+    if len(surviving) < 3:
+        print(f"[MIX] Usable tracks < 3 ({len(surviving)}), falling back to re-roll walk", flush=True)
+        if pick_gen == gen_id and bridge_active:
+            walk_state["mix_seed"] = None
+            await re_roll_walk(gen_id=gen_id)
+        return
+
+    if pick_gen != gen_id or not bridge_active:
+        print(f"[MIX] Generation changed ({pick_gen} != {gen_id}) before append, discarding mix", flush=True)
+        return
+
+    walk_state["tracks"].extend(surviving)
+    walk_state["max_tracks"] = len(walk_state["tracks"])
+    print(f"[MIX] Successfully appended {len(surviving)} mix tracks to queue (total: {len(walk_state['tracks'])})", flush=True)
+
+    await check_and_queue_ahead(gen_id)
+
+async def refill_mix_queue(mix_seed, gen_id):
+    global walk_state, pick_gen
+    seed_vid = mix_seed.get("video_id")
+    if not seed_vid:
+        return False
+
+    print(f"[MIX] Mix queue exhausted, re-seeding fresh mix from original track: {mix_seed.get('title')} ({seed_vid})", flush=True)
+    try:
+        res = await asyncio.to_thread(yt.get_watch_playlist, videoId=seed_vid, radio=True, limit=25)
+    except Exception as e:
+        print(f"[MIX] Error re-seeding mix: {e}", flush=True)
+        res = None
+
+    if pick_gen != gen_id or not bridge_active:
+        print(f"[MIX] Generation changed ({pick_gen} != {gen_id}) during mix refill, aborting", flush=True)
+        return False
+
+    raw_tracks = res.get("tracks", []) if res else []
+    surviving = []
+    seen_vids = {seed_vid}
+
+    for t in raw_tracks:
+        vid = t.get("videoId")
+        if not vid or vid in seen_vids:
+            continue
+        seen_vids.add(vid)
+        if vid in recent_played_vids:
+            continue
+
+        title = t.get("title", "Unknown")
+        artists_list = t.get("artists", [])
+        artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
+        surviving.append({
+            "title": title,
+            "artist": artist,
+            "video_id": vid,
+            "url": f"https://youtube.com/watch?v={vid}",
+            "duration": t.get("length") or t.get("duration"),
+            "via": "YT Music mix"
+        })
+
+    print(f"[MIX] Re-seed fetched {len(raw_tracks)} tracks, {len(surviving)} usable after filtering for seed {seed_vid}", flush=True)
+
+    if len(surviving) < 3:
+        print(f"[MIX] Re-seeded usable tracks < 3 ({len(surviving)}), falling back to playlist search", flush=True)
+        return False
+
+    if pick_gen != gen_id or not bridge_active:
+        return False
+
+    walk_state["tracks"] = surviving
+    walk_state["index"] = 0
+    walk_state["tracks_played"] = 0
+    walk_state["max_tracks"] = len(surviving)
+
+    first_track = surviving[0]
+    await send_bridge_cmd({
+        "cmd": "queue",
+        "url": first_track["url"],
+        "title": first_track["title"],
+        "artist": first_track["artist"],
+        "video_id": first_track.get("video_id")
+    })
+    log_pick("mix_refill", "", "ytmusic", "YT Music mix", first_track["title"], first_track["artist"], first_track.get("video_id"))
+    return True
+
 async def re_roll_walk(gen_id=0):
     global walk_state, pick_gen
     if pick_gen != gen_id: return
@@ -1008,6 +1198,14 @@ async def re_roll_walk(gen_id=0):
     if explicit:
         await start_walk(query="", source=explicit.get("source", "ytmusic"), gen_id=gen_id, explicit_playlist=explicit, interrupt=False)
         return
+
+    # MIX EXHAUSTION: check if this generation is a song route with a stored mix_seed!
+    mix_seed = walk_state.get("mix_seed")
+    if mix_seed and mix_seed.get("video_id"):
+        ok = await refill_mix_queue(mix_seed, gen_id=gen_id)
+        if ok:
+            return
+        walk_state["mix_seed"] = None
 
     query = walk_state.get("query")
     source = walk_state.get("source", "ytmusic")
@@ -1205,9 +1403,12 @@ async def announce_track_start(title, artist, url, video_id):
     global current_persona, walk_state
     
     # Snapshot walk state synchronously so the embed reflects this track.
-    playlist_name = walk_state.get("playlist_name") or "Curated"
-    track_idx = (walk_state.get("index", 0)) + 1
-    total_tracks = len(walk_state.get("tracks", []))
+    tracks = walk_state.get("tracks", [])
+    idx = walk_state.get("index", 0)
+    current_via = tracks[idx].get("via") if 0 <= idx < len(tracks) else None
+    playlist_name = current_via or walk_state.get("playlist_name") or "Curated"
+    track_idx = idx + 1
+    total_tracks = len(tracks)
     track_meta = f"track {track_idx}/{total_tracks}" if total_tracks > 1 else "track 1/1"
     
     song_url = url if url else f"https://youtube.com/watch?v={video_id}"
@@ -1344,6 +1545,39 @@ def is_play_debounced(query, walk_state, now=None):
     return False
 
 # Voice Command Parser
+async def resolve_and_start_play(query, source, channel):
+    global pick_gen, walk_state
+
+    # Run search_single_song(query) CONCURRENTLY with playlist resolver
+    song_task = asyncio.create_task(search_single_song(query, source=source))
+    playlist_task = asyncio.create_task(
+        resolve_playlist_soundcloud(query) if source == "soundcloud" else resolve_playlist_ytmusic(query)
+    )
+
+    song_res, candidates = await asyncio.gather(song_task, playlist_task)
+
+    if is_strong_song_match(query, song_res):
+        pick_gen += 1
+        current_gen = pick_gen
+
+        ack_msg = f"On it — {song_res['title']} by {song_res['artist']}."
+        asyncio.create_task(speak(ack_msg))
+        if channel:
+            await channel.send(f"👂 {ack_msg}")
+
+        await start_song_route(song_res, query=query, source=source, gen_id=current_gen)
+        asyncio.create_task(fill_mix_queue(song_res, gen_id=current_gen))
+    else:
+        pick_gen += 1
+        current_gen = pick_gen
+
+        ack_msg = get_tts_ack(query, current_persona)
+        asyncio.create_task(speak(ack_msg))
+        if channel:
+            await channel.send(f"👂 {ack_msg}")
+
+        asyncio.create_task(start_walk(query=query, source=source, gen_id=current_gen, pre_resolved_candidates=candidates))
+
 async def handle_voice_command(text, user_id):
     global current_persona, pick_gen, playback_intent
     
@@ -1411,13 +1645,7 @@ async def handle_voice_command(text, user_id):
             return
 
         playback_intent = "playing"
-        ack_msg = get_tts_ack(query, current_persona)
-        asyncio.create_task(speak(ack_msg))
-        if channel:
-            await channel.send(f"👂 {ack_msg}")
-        
-        pick_gen += 1
-        asyncio.create_task(start_walk(query=query, source=source, gen_id=pick_gen))
+        await resolve_and_start_play(query, source, channel)
         return
 
     # Unparseable
@@ -1780,6 +2008,8 @@ async def queue(ctx):
         queue_len = res.get("queue", 0)
         if queue_len > 10: desc += f"\n*+ {queue_len - 10} more*"
         embed.description = desc
+    if walk_state.get("playlist_name"):
+        embed.set_footer(text=f'via "{walk_state.get("playlist_name")}"')
     await ctx.followup.send(embed=embed)
 
 @bot.slash_command(name="status", description="Current Echo status and walk info")
