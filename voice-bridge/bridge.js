@@ -36,6 +36,7 @@ let currentTrack = null;
 let currentStreamProcess = null;
 let hasEmittedQueueEmpty = true;
 let isCommandTransition = false;
+let suppressQueueEmpty = false;
 let trackStartTime = 0;
 
 function killStreamProcess() {
@@ -47,9 +48,32 @@ function killStreamProcess() {
     }
 }
 
+function cleanupTrackFiles(track) {
+    if (!track) return;
+    if (track.prefetchProc) {
+        const proc = track.prefetchProc;
+        track.prefetchProc = null;
+        track.isDownloading = false;
+        try { proc.kill(); } catch (e) {}
+    } else {
+        track.isDownloading = false;
+    }
+    const candidates = [];
+    if (track.localFile) candidates.push(track.localFile);
+    if (track.tmpFile) {
+        candidates.push(track.tmpFile, `${track.tmpFile}.part`);
+    }
+    for (const f of candidates) {
+        try {
+            if (fs.existsSync(f)) fs.unlinkSync(f);
+        } catch (e) {}
+    }
+    track.localFile = null;
+}
+
 const player = createAudioPlayer({
     behaviors: {
-        noSubscriber: NoSubscriberBehavior.Play,
+        noSubscriber: NoSubscriberBehavior.Pause,
     },
 });
 
@@ -101,10 +125,15 @@ function prefetchNext() {
     if (!nextTrack) return;
     
     nextTrack.isDownloading = true;
-    const tmpFile = path.join(tempDir, `track_${Date.now()}`);
-    execFile('yt-dlp', ['--no-playlist', '-f', 'bestaudio', '-o', tmpFile, nextTrack.url], (err, stdout, stderr) => {
+    const tmpFile = path.join(tempDir, `track_${Date.now()}_${Math.floor(Math.random() * 10000)}`);
+    nextTrack.tmpFile = tmpFile;
+    const proc = execFile('yt-dlp', ['--js-runtimes', 'node', '--no-playlist', '-f', 'bestaudio', '-o', tmpFile, nextTrack.url], (err, stdout, stderr) => {
+        const wasCancelled = !nextTrack.isDownloading;
+        nextTrack.prefetchProc = null;
+        if (wasCancelled) return;
         if (!err && fs.existsSync(tmpFile)) {
             nextTrack.localFile = tmpFile;
+            nextTrack.isDownloading = false;
             if (DEBUG) console.log(`[DEBUG] Prefetched: ${nextTrack.title}`);
             prefetchNext(); // cascade prefetch
         } else {
@@ -112,13 +141,14 @@ function prefetchNext() {
             nextTrack.isDownloading = false;
         }
     });
+    nextTrack.prefetchProc = proc;
 }
 
-function playNext(wasCommand = false, lastDuration = 0) {
+function playNext(noRefill = false, lastDuration = 0) {
     if (audioQueue.length === 0) {
         currentTrack = null;
         killStreamProcess();
-        if (!hasEmittedQueueEmpty && !wasCommand) {
+        if (!hasEmittedQueueEmpty && !noRefill) {
             hasEmittedQueueEmpty = true;
             if (DEBUG) console.log(`[DEBUG] Queue empty, emitting queue_empty event. Last duration: ${lastDuration}s`);
             tcpClient.write(JSON.stringify({ event: 'queue_empty', last_duration: lastDuration, player: 'idle' }) + '\n');
@@ -135,7 +165,7 @@ function playNext(wasCommand = false, lastDuration = 0) {
     if (audioQueue.length === 0) {
         hasEmittedQueueEmpty = true;
         if (DEBUG) console.log(`[DEBUG] Queue empty after shift, emitting early queue_empty event`);
-        if (!wasCommand) {
+        if (!noRefill) {
             tcpClient.write(JSON.stringify({ event: 'queue_empty', last_duration: 0, player: 'playing' }) + '\n');
         }
     } else {
@@ -149,9 +179,10 @@ function playNext(wasCommand = false, lastDuration = 0) {
         prefetchNext();
     } else {
         if (DEBUG) console.log(`[DEBUG] Not prefetched. Streaming with yt-dlp: ${track.title}`);
+        cleanupTrackFiles(track);
         killStreamProcess();
 
-        const child = spawn('yt-dlp', ['--no-playlist', '-f', 'bestaudio', '-o', '-', track.url], {
+        const child = spawn('yt-dlp', ['--js-runtimes', 'node', '--no-playlist', '-f', 'bestaudio', '-o', '-', track.url], {
             stdio: ['ignore', 'pipe', 'pipe']
         });
         currentStreamProcess = child;
@@ -159,6 +190,7 @@ function playNext(wasCommand = false, lastDuration = 0) {
         child.on('error', (err) => {
             console.warn('[WARNING] yt-dlp stream spawn error:', err);
             isCommandTransition = true;
+            suppressQueueEmpty = true;
             killStreamProcess();
             player.stop(true);
         });
@@ -171,6 +203,7 @@ function playNext(wasCommand = false, lastDuration = 0) {
         resource.playStream.on('error', (err) => {
             console.warn('[WARNING] Audio resource stream error:', err);
             isCommandTransition = true;
+            suppressQueueEmpty = true;
             killStreamProcess();
             player.stop(true);
         });
@@ -205,15 +238,16 @@ function startLocalPlayback(filePath) {
     } catch (err) {
         console.warn('[WARNING] Audio resource creation failed:', err);
         isCommandTransition = true;
+        suppressQueueEmpty = true;
         player.stop(true);
     }
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
     const playDuration = (Date.now() - trackStartTime) / 1000;
-    const wasCommand = isCommandTransition;
+    const noRefill = suppressQueueEmpty;
     
-    if (DEBUG) console.log(`[DEBUG] AudioPlayer transitioned to Idle. Played for ${playDuration.toFixed(2)}s. isCommandTransition: ${isCommandTransition}`);
+    if (DEBUG) console.log(`[DEBUG] AudioPlayer transitioned to Idle. Played for ${playDuration.toFixed(2)}s. isCommandTransition: ${isCommandTransition}, suppressQueueEmpty: ${suppressQueueEmpty}`);
     
     killStreamProcess();
     
@@ -223,21 +257,20 @@ player.on(AudioPlayerStatus.Idle, () => {
         allowGaplessRefill = false;
     }
 
-    if (!allowGaplessRefill && audioQueue.length === 0) {
-        if (DEBUG) console.log('[DEBUG] Suppressing queue_empty event due to premature track death.');
+    if ((!allowGaplessRefill || noRefill) && audioQueue.length === 0) {
+        if (DEBUG) console.log('[DEBUG] Suppressing queue_empty event.');
         hasEmittedQueueEmpty = true; 
     } else {
         hasEmittedQueueEmpty = false; // Reset to ensure we always try to fetch next track
     }
 
     isCommandTransition = false;
+    suppressQueueEmpty = false;
     
     // Clean up local file to save space
-    if (currentTrack && currentTrack.localFile) {
-        try { fs.unlinkSync(currentTrack.localFile); } catch(e) {}
-    }
+    cleanupTrackFiles(currentTrack);
 
-    playNext(wasCommand, playDuration);
+    playNext(noRefill, playDuration);
 });
 
 player.on('error', (error) => {
@@ -245,6 +278,7 @@ player.on('error', (error) => {
     console.warn(`[WARNING] AudioPlayer Error after ${playDuration.toFixed(2)}s: ${error.message}`);
     killStreamProcess();
     isCommandTransition = true;
+    suppressQueueEmpty = true;
     player.stop(true);
 });
 
@@ -342,6 +376,7 @@ tcpClient.on('data', (chunk) => {
                 }
             } else if (msg.cmd === 'clear_upcoming') {
                 if (DEBUG) console.log('[DEBUG] Received clear_upcoming cmd');
+                audioQueue.forEach(cleanupTrackFiles);
                 audioQueue = [];
                 if (msg.uuid) {
                     tcpClient.write(JSON.stringify({ event: 'clear_upcoming_ack', status: 'ok', uuid: msg.uuid }) + '\n');
@@ -349,11 +384,10 @@ tcpClient.on('data', (chunk) => {
             } else if (msg.cmd === 'skip') {
                 if (DEBUG) console.log('[DEBUG] Received skip cmd');
                 isCommandTransition = true;
+                suppressQueueEmpty = false;
                 hasEmittedQueueEmpty = false;
                 killStreamProcess();
-                player.stop(); 
-
-
+                player.stop(true);
             } else if (msg.cmd === 'back') {
                 if (DEBUG) console.log('[DEBUG] Received back cmd (handled by Python)');
                 if (msg.uuid) {
@@ -369,7 +403,9 @@ tcpClient.on('data', (chunk) => {
             } else if (msg.cmd === 'stop') {
                 if (DEBUG) console.log('[DEBUG] Received stop cmd');
                 isCommandTransition = true;
+                suppressQueueEmpty = true;
                 killStreamProcess();
+                audioQueue.forEach(cleanupTrackFiles);
                 audioQueue = [];
                 duckingPause = false;
                 player.stop(true);
@@ -378,7 +414,7 @@ tcpClient.on('data', (chunk) => {
                     event: 'status',
                     queue: audioQueue.length,
                     playing: currentTrack ? { title: currentTrack.title, artist: currentTrack.artist } : null,
-                    paused: player.state.status === AudioPlayerStatus.Paused || player.state.status === AudioPlayerStatus.AutoPaused,
+                    paused: player.state.status === AudioPlayerStatus.Paused,
                     up_next: audioQueue.slice(0, 10).map(t => ({ title: t.title, artist: t.artist })),
                     history_count: 0,
                     uuid: msg.uuid
@@ -386,16 +422,27 @@ tcpClient.on('data', (chunk) => {
                 tcpClient.write(JSON.stringify(resp) + '\n');
             } else if (msg.cmd === 'speak') {
                 if (DEBUG) console.log('[DEBUG] Received speak cmd');
-                const pcmBytes = Buffer.from(msg.pcm_b64, 'base64');
+                ttsDiagStart();
+                const rawBytes = Buffer.from(msg.pcm_b64, 'base64');
+                const frameBytes = 3840; // 20ms @ 48kHz stereo s16le
+                const rem = rawBytes.length % frameBytes;
+                const pcmBytes = rem === 0 ? rawBytes : Buffer.concat([rawBytes, Buffer.alloc(frameBytes - rem)]);
                 const tRecv = Date.now();
                 console.log(`[TTS] recv seq=${msg.seq} cue="${msg.cue || ''}" bytes=${pcmBytes.length} alreadyPlaying=${isTtsPlaying}`);
                 if (isTtsPlaying) console.log(`[TTS] WARNING: speak arrived while previous TTS still playing (seq=${msg.seq})`);
                 const durationSec = (pcmBytes.length / 192000).toFixed(2);
                 console.log(`[TTS] Received speak audio: ${pcmBytes.length} bytes (~${durationSec}s)`);
+                let readOffset = 0;
+                const chunkBytes = frameBytes * 5; // 100ms (19200 bytes) per pull
                 const readable = new (require('stream').Readable)({
                     read() {
-                        this.push(pcmBytes);
-                        this.push(null);
+                        if (readOffset >= pcmBytes.length) {
+                            this.push(null);
+                            return;
+                        }
+                        const end = Math.min(readOffset + chunkBytes, pcmBytes.length);
+                        this.push(pcmBytes.subarray(readOffset, end));
+                        readOffset = end;
                     }
                 });
                 const { StreamType } = require('@discordjs/voice');
@@ -410,7 +457,6 @@ tcpClient.on('data', (chunk) => {
                 ttsDbg = {seq: msg.seq, tPlay: Date.now(), expectedMs: pcmBytes.length / 192};
                 console.log(`[TTS] play seq=${msg.seq} recv_to_play_ms=${ttsDbg.tPlay - tRecv}`);
                 ttsPlayer.play(resource);
-                ttsDiagStart();
             }
         } catch (e) {
             console.error('[CRITICAL] TCP JSON parse error in bridge.js:', e);

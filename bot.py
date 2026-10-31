@@ -276,12 +276,26 @@ vibe_poll = {
     "vibe_name": None,
     "inserted_title": None
 }
-TTS_DEBUG_WAV = True
+TTS_DEBUG_WAV = os.getenv("TTS_DEBUG_WAV", "false").lower() == "true"
 tts_dbg_seq = 0
 TTS_DONE_TIMEOUT_PAD = 10.0
 tts_cue_done = asyncio.Event()
 tts_cue_done.set()
-os.makedirs("logs/tts-debug", exist_ok=True)
+tts_pcm_cache = {}
+STATIC_TTS_CUES = (
+    "Skipping.",
+    "Paused.",
+    "Resuming.",
+    "Stopped.",
+    "Radio mode on.",
+    "Already on it.",
+    "already on it",
+    "Didn't catch that.",
+    "Yo, didn't catch that, run it back!",
+    "Nothing is playing right now.",
+)
+if TTS_DEBUG_WAV:
+    os.makedirs("logs/tts-debug", exist_ok=True)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -480,6 +494,53 @@ def resample_24k_to_48k(samples: np.ndarray, sr: int = 24000) -> np.ndarray:
 tts_queue = asyncio.Queue()
 _tts_worker_task = None
 
+def _synthesize_tts_payload(text: str):
+    samples, sr = kokoro.create(text, voice=TTS_VOICE, speed=1.1, lang="en-gb")
+    upsampled = resample_24k_to_48k(samples, sr)
+    # Prepend 60ms (2880 samples) and append 40ms (1920 samples) of silence for clean Opus SSRC transitions
+    lead_silence = np.zeros(2880, dtype=np.float32)
+    tail_silence = np.zeros(1920, dtype=np.float32)
+    padded = np.concatenate((lead_silence, upsampled.astype(np.float32), tail_silence))
+    # Align to exact 20ms frame multiple (960 samples @ 48kHz = 3840 stereo int16 bytes) so prism-media drops 0 bytes
+    rem = len(padded) % 960
+    if rem != 0:
+        padded = np.concatenate((padded, np.zeros(960 - rem, dtype=np.float32)))
+    clipped = np.clip(padded, -1.0, 1.0)
+    stereo_i16 = np.column_stack((clipped, clipped))
+    pcm_i16 = (stereo_i16 * 32767.0).astype(np.int16)
+    pcm_s16le = pcm_i16.tobytes()
+
+    fname = None
+    if TTS_DEBUG_WAV:
+        try:
+            os.makedirs("logs/tts-debug", exist_ok=True)
+            fname = f"logs/tts-debug/{time.strftime('%H%M%S')}-{hashlib.md5(text.encode()).hexdigest()[:6]}.wav"
+            sf.write(fname, pcm_i16, 48000, subtype="PCM_16")
+        except Exception as e:
+            print(f"[TTS-DBG] Failed to write debug wav: {e}", flush=True)
+
+    pcm_b64 = base64.b64encode(pcm_s16le).decode("utf-8")
+    duration = len(padded) / 48000.0
+    return pcm_b64, len(pcm_s16le), duration, fname
+
+def _warm_tts_cache_sync():
+    if not TTS_ENABLED or not kokoro:
+        return
+    t0 = time.perf_counter()
+    count = 0
+    for cue in STATIC_TTS_CUES:
+        if cue not in tts_pcm_cache:
+            try:
+                pcm_b64, n_bytes, dur, _ = _synthesize_tts_payload(cue)
+                tts_pcm_cache[cue] = (pcm_b64, n_bytes, dur)
+                count += 1
+            except Exception as e:
+                print(f"[TTS] Cache warmup failed for '{cue}': {e}", flush=True)
+    print(f"[TTS] Pre-cached {count} static cues in {(time.perf_counter() - t0):.2f}s.", flush=True)
+
+async def warmup_tts_cache():
+    await asyncio.to_thread(_warm_tts_cache_sync)
+
 async def _tts_worker():
     while True:
         try:
@@ -489,36 +550,31 @@ async def _tts_worker():
                 continue
             try:
                 t0 = time.perf_counter()
-                samples, sr = await asyncio.to_thread(kokoro.create, text, voice=TTS_VOICE, speed=1.1, lang="en-gb")
-                gen_ms = (time.perf_counter() - t0) * 1000
-                upsampled = resample_24k_to_48k(samples, sr)
-                stereo = np.column_stack((upsampled, upsampled))
-                pcm_s16le = (stereo * 32767).astype(np.int16).tobytes()
+                cached = tts_pcm_cache.get(text)
+                if cached is not None:
+                    pcm_b64, n_bytes, duration = cached
+                    fname = "cache"
+                    gen_ms = 0.0
+                else:
+                    pcm_b64, n_bytes, duration, fname = await asyncio.to_thread(_synthesize_tts_payload, text)
+                    gen_ms = (time.perf_counter() - t0) * 1000
+                    if text in STATIC_TTS_CUES:
+                        tts_pcm_cache[text] = (pcm_b64, n_bytes, duration)
 
-                fname = None
-                if TTS_DEBUG_WAV:
-                    try:
-                        fname = f"logs/tts-debug/{time.strftime('%H%M%S')}-{hashlib.md5(text.encode()).hexdigest()[:6]}.wav"
-                        sf.write(fname, np.frombuffer(pcm_s16le, dtype=np.int16).reshape(-1, 2), 48000, subtype="PCM_16")
-                    except Exception as e:
-                        print(f"[TTS-DBG] Failed to write debug wav: {e}", flush=True)
-
-                pcm_b64 = base64.b64encode(pcm_s16le).decode('utf-8')
                 global tts_dbg_seq
                 seq = tts_dbg_seq
                 tts_dbg_seq += 1
 
-                duration = len(upsampled) / 48000.0
                 tts_cue_done.clear()
 
                 await send_bridge_cmd({
                     "cmd": "speak",
                     "pcm_b64": pcm_b64,
-                    "n": len(pcm_s16le),
+                    "n": n_bytes,
                     "seq": seq,
                     "cue": text[:50]
                 })
-                print(f"[TTS-DBG] seq={seq} cue='{text[:60]}' gen_ms={gen_ms:.0f} bytes={len(pcm_s16le)} file={fname}", flush=True)
+                print(f"[TTS-DBG] seq={seq} cue='{text[:60]}' gen_ms={gen_ms:.0f} bytes={n_bytes} file={fname}", flush=True)
 
                 try:
                     await asyncio.wait_for(tts_cue_done.wait(), timeout=duration + TTS_DONE_TIMEOUT_PAD)
@@ -1352,6 +1408,7 @@ async def start_song_route(song_res, query, source, gen_id):
             "video_id": song_track.get("video_id")
         })
         log_pick("echo", query, source, song_track["via"], song_track["title"], song_track["artist"], song_track.get("video_id"))
+        ensure_mix_fill(gen_id)
     finally:
         walk_in_flight = False
 
@@ -2246,10 +2303,10 @@ async def handle_voice_command(text, user_id):
     if action == "skip":
         cancel_poll()
         playback_intent = "playing"
+        asyncio.create_task(speak("Skipping."))
         await send_bridge_cmd({"cmd": "skip"})
         if walk_state.get("mix_seed") and len(walk_state.get("tracks", [])) <= 1:
-            await ensure_mix_fill(pick_gen)
-        asyncio.create_task(speak("Skipping."))
+            ensure_mix_fill(pick_gen)
         if channel: await channel.send("⏭️ Skipping track.")
         return
 
@@ -2339,6 +2396,8 @@ async def handle_voice_command(text, user_id):
         await channel.send(f"🤖 {unparseable_msg}")
 
 # Audio VAD & Buffer
+UTTERANCE_SILENCE_TIMEOUT = 0.65
+
 class UserAudioBuffer:
     def __init__(self, user_id):
         self.user_id = user_id
@@ -2349,42 +2408,64 @@ class UserAudioBuffer:
         self.is_speaking = False
         self.audio_first_packet = 0
         self.vad_speech_start = 0
+        self.last_speech_ts = 0
+
+    def flush(self, queue, endpoint_ts=None):
+        if not self.utterance_buffer:
+            self.is_speaking = False
+            self.silence_frames = 0
+            self.audio_first_packet = 0
+            self.last_speech_ts = 0
+            return
+        vad_endpoint = endpoint_ts if endpoint_ts else (self.last_speech_ts or time.time())
+        queue.put_nowait((self.user_id, bytes(self.utterance_buffer), self.audio_first_packet, self.vad_speech_start, vad_endpoint))
+        self.is_speaking = False
+        self.utterance_buffer = bytearray()
+        self.silence_frames = 0
+        self.audio_first_packet = 0
+        self.last_speech_ts = 0
 
     def add_data(self, data, queue):
+        now = time.time()
         if not self.pcm_buffer and not self.is_speaking:
-            self.audio_first_packet = time.time()
+            self.audio_first_packet = now
             
         self.pcm_buffer.extend(data)
         while len(self.pcm_buffer) >= 960:
             frame = bytes(self.pcm_buffer[:960])
             self.pcm_buffer = self.pcm_buffer[960:]
             try: is_speech = self.vad.is_speech(frame, 16000)
-            except: continue
+            except Exception: continue
 
             if is_speech:
+                now = time.time()
                 if not self.is_speaking:
                     self.is_speaking = True
-                    self.vad_speech_start = time.time()
+                    self.vad_speech_start = now
+                self.last_speech_ts = now
                 self.utterance_buffer.extend(frame)
                 self.silence_frames = 0
                 if len(self.utterance_buffer) >= 12 * 16000 * 2:
-                    self.is_speaking = False
-                    vad_endpoint = time.time()
-                    queue.put_nowait((self.user_id, bytes(self.utterance_buffer), self.audio_first_packet, self.vad_speech_start, vad_endpoint))
-                    self.utterance_buffer = bytearray()
-                    self.silence_frames = 0
-                    self.audio_first_packet = 0
+                    self.flush(queue, endpoint_ts=now)
             else:
                 if self.is_speaking:
                     self.utterance_buffer.extend(frame)
                     self.silence_frames += 1
-                    if self.silence_frames > 25:
-                        self.is_speaking = False
-                        vad_endpoint = time.time()
-                        queue.put_nowait((self.user_id, bytes(self.utterance_buffer), self.audio_first_packet, self.vad_speech_start, vad_endpoint))
-                        self.utterance_buffer = bytearray()
-                        self.silence_frames = 0
-                        self.audio_first_packet = 0
+                    if self.silence_frames > 20:
+                        self.flush(queue, endpoint_ts=self.last_speech_ts)
+
+async def utterance_flush_watchdog():
+    while True:
+        try:
+            await asyncio.sleep(0.1)
+            now = time.time()
+            for buf in list(user_buffers.values()):
+                if buf.is_speaking and buf.last_speech_ts > 0 and (now - buf.last_speech_ts) >= UTTERANCE_SILENCE_TIMEOUT:
+                    buf.flush(utterance_queue, endpoint_ts=buf.last_speech_ts)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[STT] utterance_flush_watchdog error: {e}", flush=True)
 
 def do_transcribe(audio_np):
     try:
@@ -2701,7 +2782,7 @@ async def skip(ctx):
     playback_intent = "playing"
     await send_bridge_cmd({"cmd": "skip"})
     if walk_state.get("mix_seed") and len(walk_state.get("tracks", [])) <= 1:
-        await ensure_mix_fill(pick_gen)
+        ensure_mix_fill(pick_gen)
     await ctx.followup.send("Skipped current track ⏭️")
 
 @bot.slash_command(name="back", description="Play previous track")
@@ -2972,6 +3053,8 @@ async def command_file_watcher():
             if DEBUG: print(f"[DEBUG] command_file_watcher error: {e}", flush=True)
         await asyncio.sleep(0.5)
 
+_flush_watchdog_task = None
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -2980,12 +3063,15 @@ async def on_ready():
     bot.add_view(VibePollView())
     print("[DEBUG] Warming up Ollama...")
     bot.loop.create_task(warmup_ollama())
+    bot.loop.create_task(warmup_tts_cache())
     get_stt_model()
     bot.loop.create_task(transcribe_worker())
     bot.loop.create_task(command_file_watcher())
-    global _tts_worker_task
+    global _tts_worker_task, _flush_watchdog_task
     if _tts_worker_task is None or _tts_worker_task.done():
         _tts_worker_task = bot.loop.create_task(_tts_worker())
+    if _flush_watchdog_task is None or _flush_watchdog_task.done():
+        _flush_watchdog_task = bot.loop.create_task(utterance_flush_watchdog())
 
 if __name__ == "__main__":
     if not os.path.exists("logs"): os.makedirs("logs")
