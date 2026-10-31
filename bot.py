@@ -1274,8 +1274,13 @@ async def advance_walk(trigger="keep_ahead", gen_id=0):
             print(f"[WALK] advance: seed playing, mix pending — waiting for mix fill", flush=True)
             ensure_mix_fill(gen_id)
             return
-        track = tracks[start_idx]
-        chosen_idx = start_idx
+        if walk_state.get("explicit_playlist"):
+            track = tracks[start_idx]
+            chosen_idx = start_idx
+        else:
+            print(f"[WALK] advance: playlist exhausted ({len(tracks)} tracks), re-rolling", flush=True)
+            await re_roll_walk(gen_id=gen_id)
+            return
 
     walk_state["queued_index"] = chosen_idx
 

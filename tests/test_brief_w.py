@@ -233,19 +233,20 @@ async def test_advance_walk_guard_and_ensure_mix_fill():
         assert len(fill_called) == 1, "ensure_mix_fill must be idempotent for same gen"
         print("  [PASS] ensure_mix_fill is idempotent on matching gen_id")
 
-    # Non-song-route (mix_seed is None): old fallback queues track
+    # Explicit playlist (mix_seed is None): loop fallback queues track
     bot.walk_state = {
         "tracks": [dict(seed)],
         "index": 0,
         "tracks_played": 0,
         "max_tracks": 12,
-        "mix_seed": None
+        "mix_seed": None,
+        "explicit_playlist": {"title": "Test Explicit"}
     }
     with patch.object(bot, 'send_bridge_cmd', AsyncMock()) as mock_bridge2:
         await bot.advance_walk("keep_ahead", gen_id=30)
         queued_vids = [call[0][0].get("video_id") for call in mock_bridge2.call_args_list if call[0][0].get("cmd") == "queue"]
         assert "seed_vid" in queued_vids
-        print("  [PASS] Non-song-route single-track preserves old fallback behavior")
+        print("  [PASS] Explicit playlist single-track preserves loop fallback behavior")
 
 async def test_mix_now_playing_edit():
     print("--- Test 7: A5 mix now-playing embed update ---")
