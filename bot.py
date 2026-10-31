@@ -2393,9 +2393,20 @@ async def transcribe_worker():
             user_id, audio_bytes, t_first, t_start, t_end = await utterance_queue.get()
             if len(audio_bytes) < 16000 * 0.5 * 2: continue
             
+            # FIX-V2: drop stale utterances — a command older than 15s is dead
+            _age = time.time() - t_end
+            if _age > 15:
+                print(f"[STT] Dropping stale utterance ({_age:.1f}s old, qsize={utterance_queue.qsize()})", flush=True)
+                continue
+            
             audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             t_whisper0 = time.time()
-            text = await asyncio.to_thread(do_transcribe, audio_np)
+            # FIX-V2: bound Whisper — repetition looping can stall 10-40s on garbage audio
+            try:
+                text = await asyncio.wait_for(asyncio.to_thread(do_transcribe, audio_np), timeout=10.0)
+            except asyncio.TimeoutError:
+                print(f"[STT] Whisper timeout (10s) on {len(audio_bytes)/32000:.1f}s audio, dropping utterance", flush=True)
+                continue
             t_emit = time.time()
             print(f"[DEBUG-LATENCY] {user_id} | endpoint -> emit: {t_emit - t_end:.2f}s (whisper: {t_emit - t_whisper0:.2f}s, qsize={utterance_queue.qsize()}, audio_s={len(audio_bytes)/32000:.1f})", flush=True)
             
