@@ -56,8 +56,11 @@ const player = createAudioPlayer({
 const ttsPlayer = createAudioPlayer();
 let isTtsPlaying = false;
 let duckingPause = false;
+let ttsDbg = {seq: null, tPlay: 0, expectedMs: 0};
 
 ttsPlayer.on(AudioPlayerStatus.Idle, () => {
+    const elapsed = Date.now() - (ttsDbg.tPlay || Date.now());
+    console.log(`[TTS] idle seq=${ttsDbg.seq} elapsed_ms=${elapsed} expected_ms=${Math.round(ttsDbg.expectedMs)}`);
     isTtsPlaying = false;
     const { getVoiceConnection } = require('@discordjs/voice');
     const connection = getVoiceConnection(GUILD_ID);
@@ -361,6 +364,9 @@ tcpClient.on('data', (chunk) => {
             } else if (msg.cmd === 'speak') {
                 if (DEBUG) console.log('[DEBUG] Received speak cmd');
                 const pcmBytes = Buffer.from(msg.pcm_b64, 'base64');
+                const tRecv = Date.now();
+                console.log(`[TTS] recv seq=${msg.seq} cue="${msg.cue || ''}" bytes=${pcmBytes.length} alreadyPlaying=${isTtsPlaying}`);
+                if (isTtsPlaying) console.log(`[TTS] WARNING: speak arrived while previous TTS still playing (seq=${msg.seq})`);
                 const durationSec = (pcmBytes.length / 192000).toFixed(2);
                 console.log(`[TTS] Received speak audio: ${pcmBytes.length} bytes (~${durationSec}s)`);
                 const readable = new (require('stream').Readable)({
@@ -383,6 +389,8 @@ tcpClient.on('data', (chunk) => {
                 if (connection) {
                     connection.subscribe(ttsPlayer);
                 }
+                ttsDbg = {seq: msg.seq, tPlay: Date.now(), expectedMs: pcmBytes.length / 192};
+                console.log(`[TTS] play seq=${msg.seq} recv_to_play_ms=${ttsDbg.tPlay - tRecv}`);
                 ttsPlayer.play(resource);
             }
         } catch (e) {

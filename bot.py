@@ -12,6 +12,7 @@ import subprocess
 import traceback
 import logging
 import inspect
+import hashlib
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -275,6 +276,9 @@ vibe_poll = {
     "vibe_name": None,
     "inserted_title": None
 }
+TTS_DEBUG_WAV = True
+tts_dbg_seq = 0
+os.makedirs("logs/tts-debug", exist_ok=True)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -480,12 +484,35 @@ async def _tts_worker():
                 tts_queue.task_done()
                 continue
             try:
+                t0 = time.perf_counter()
                 samples, sr = await asyncio.to_thread(kokoro.create, text, voice=TTS_VOICE, speed=1.1, lang="en-gb")
+                gen_ms = (time.perf_counter() - t0) * 1000
                 upsampled = resample_24k_to_48k(samples, sr)
                 stereo = np.column_stack((upsampled, upsampled))
                 pcm_s16le = (stereo * 32767).astype(np.int16).tobytes()
+
+                fname = None
+                if TTS_DEBUG_WAV:
+                    try:
+                        fname = f"logs/tts-debug/{time.strftime('%H%M%S')}-{hashlib.md5(text.encode()).hexdigest()[:6]}.wav"
+                        sf.write(fname, np.frombuffer(pcm_s16le, dtype=np.int16).reshape(-1, 2), 48000, subtype="PCM_16")
+                    except Exception as e:
+                        print(f"[TTS-DBG] Failed to write debug wav: {e}", flush=True)
+
                 pcm_b64 = base64.b64encode(pcm_s16le).decode('utf-8')
-                await send_bridge_cmd({"cmd": "speak", "pcm_b64": pcm_b64, "n": len(pcm_s16le)})
+                global tts_dbg_seq
+                seq = tts_dbg_seq
+                tts_dbg_seq += 1
+
+                await send_bridge_cmd({
+                    "cmd": "speak",
+                    "pcm_b64": pcm_b64,
+                    "n": len(pcm_s16le),
+                    "seq": seq,
+                    "cue": text[:50]
+                })
+                print(f"[TTS-DBG] seq={seq} cue='{text[:60]}' gen_ms={gen_ms:.0f} bytes={len(pcm_s16le)} file={fname}", flush=True)
+
                 duration = len(upsampled) / 48000.0
                 await asyncio.sleep(duration)
             except Exception as e:
@@ -724,6 +751,26 @@ def parse_poll_vote(text: str) -> str | None:
     if not change_matches:
         return "keep"
     return "change" if change_matches[-1] > keep_matches[-1] else "keep"
+
+def _vote_remainder(text: str) -> str | None:
+    if not text:
+        return None
+    r = POLL_CHANGE_RE.sub('', text)
+    r = POLL_KEEP_RE.sub('', r)
+    r = re.sub(r'\b(hey\s+)?(echo|ecko|eco)\b', '', r, flags=re.IGNORECASE)
+    r = r.strip(" .,!?:;'\"")
+    while True:
+        m = re.match(r'^(and|then|so|okay|ok)\b', r, flags=re.IGNORECASE)
+        if m:
+            r = r[m.end():].strip(" .,!?:;'\"")
+        else:
+            break
+    if not r:
+        return None
+    parsed = parse_voice_command(r)
+    if parsed.get("action") == "unparseable":
+        return None
+    return r
 
 async def search_single_song(query, source="ytmusic"):
     if source == "ytmusic":
@@ -1265,7 +1312,7 @@ async def start_song_route(song_res, query, source, gen_id):
     try:
         song_track = dict(song_res)
         song_track["resultType"] = song_res.get("resultType", "song")
-        song_track["via"] = "YouTube" if song_track.get("resultType") == "video" else "YT Music mix"
+        song_track["via"] = "YouTube" if song_track.get("resultType") == "video" else "YouTube Music"
 
         walk_state = {
             "query": query,
@@ -2064,7 +2111,6 @@ async def start_vibe_change():
     global walk_state, pick_gen
     pick_gen += 1
     new_gen = pick_gen
-    await send_bridge_cmd({"cmd": "clear_upcoming"})
     cur_idx = walk_state.get("index", 0)
     tracks = walk_state.get("tracks", [])
     if tracks and 0 <= cur_idx < len(tracks):
@@ -2072,6 +2118,9 @@ async def start_vibe_change():
     else:
         cur = {"title": "Unknown", "artist": "Unknown", "url": "", "video_id": None}
     cur.pop("inserted", None)
+    if now_playing_ref.get("video_id") == cur.get("video_id"):
+        now_playing_ref["gen"] = new_gen
+    await send_bridge_cmd({"cmd": "clear_upcoming"})
     walk_state = {
         "query": f"vibe change from {cur.get('title')}",
         "source": "ytmusic",
@@ -2246,6 +2295,7 @@ async def handle_voice_command(text, user_id):
 
         song_res = await search_single_song(query, source=source)
         if not song_res or not is_strong_song_match(query, song_res):
+            last_insert.update(query=None, ts=0.0)
             await speak(f"Couldn't find {query}.")
             if channel:
                 await channel.send(f"❌ Couldn't find {query}.")
@@ -2349,6 +2399,9 @@ async def transcribe_worker():
                     vote = parse_poll_vote(text)
                     if vote:
                         asyncio.create_task(resolve_poll(vote, via="voice"))
+                        remainder = _vote_remainder(text)
+                        if remainder:
+                            asyncio.create_task(handle_voice_command(remainder, user_id))
                     elif re.search(r'\b(echo|ecko|eco)\b', text, re.IGNORECASE):
                         asyncio.create_task(handle_voice_command(text, user_id))
                 elif re.search(r'\b(echo|ecko|eco)\b', text, re.IGNORECASE):
@@ -2719,10 +2772,14 @@ async def handle_mention_chat(message, text):
 
 You are Echo, a DJ chatting in the text channel. Stay in character. Keep the reply to 1-3 sentences. Never claim abilities you don't have (no web access, no reminders, no tools).
 
-Recent text chat conversation:
+RULES FOR THIS REPLY:
+1. Answer {user_name}'s direct question below FIRST — that is your job. The recent conversation is background color only; do not get distracted by it or answer a different question than the one asked.
+2. Names of artists, songs, and albums are metadata about what's playing — never people in the channel. Never address an artist as if they're here listening.
+
+Recent text chat conversation (background only, not the question):
 {history_block}
 
-{user_name}: {text}
+{user_name} asks you directly: {text}
 
 Echo:"""
 
@@ -2845,6 +2902,9 @@ async def command_file_watcher():
                             vote = parse_poll_vote(content)
                             if vote:
                                 asyncio.create_task(resolve_poll(vote, via="voice"))
+                                remainder = _vote_remainder(content)
+                                if remainder:
+                                    asyncio.create_task(handle_voice_command(remainder, 0))
                             else:
                                 await handle_voice_command(content, 0)
                         else:
