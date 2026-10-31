@@ -58,9 +58,33 @@ let isTtsPlaying = false;
 let duckingPause = false;
 let ttsDbg = {seq: null, tPlay: 0, expectedMs: 0};
 
+// DIAG-1: temporary event-loop lag monitor for long-cue investigation
+let ttsDiagLagTimer = null;
+let ttsDiagMaxLag = 0;
+let ttsDiagLast = 0;
+function ttsDiagStart() {
+    ttsDiagMaxLag = 0;
+    ttsDiagLast = Date.now();
+    if (ttsDiagLagTimer) clearInterval(ttsDiagLagTimer);
+    ttsDiagLagTimer = setInterval(() => {
+        const now = Date.now();
+        const lag = now - ttsDiagLast - 100;
+        if (lag > ttsDiagMaxLag) ttsDiagMaxLag = lag;
+        ttsDiagLast = now;
+    }, 100);
+}
+function ttsDiagStop(seq) {
+    if (ttsDiagLagTimer) {
+        clearInterval(ttsDiagLagTimer);
+        ttsDiagLagTimer = null;
+        console.log(`[TTS-DIAG] seq=${seq} max_eventloop_lag_ms=${ttsDiagMaxLag} music_status=${player.state.status}`);
+    }
+}
+
 ttsPlayer.on(AudioPlayerStatus.Idle, () => {
     const elapsed = Date.now() - (ttsDbg.tPlay || Date.now());
     console.log(`[TTS] idle seq=${ttsDbg.seq} elapsed_ms=${elapsed} expected_ms=${Math.round(ttsDbg.expectedMs)}`);
+    ttsDiagStop(ttsDbg.seq);
     isTtsPlaying = false;
     const { getVoiceConnection } = require('@discordjs/voice');
     const connection = getVoiceConnection(GUILD_ID);
@@ -386,6 +410,7 @@ tcpClient.on('data', (chunk) => {
                 ttsDbg = {seq: msg.seq, tPlay: Date.now(), expectedMs: pcmBytes.length / 192};
                 console.log(`[TTS] play seq=${msg.seq} recv_to_play_ms=${ttsDbg.tPlay - tRecv}`);
                 ttsPlayer.play(resource);
+                ttsDiagStart();
             }
         } catch (e) {
             console.error('[CRITICAL] TCP JSON parse error in bridge.js:', e);

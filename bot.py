@@ -2891,6 +2891,12 @@ async def command_file_watcher():
                     elif content.startswith("direct_playlist "):
                         url = content[16:].strip()
                         await handle_direct_playlist(url)
+                    elif content.startswith("diag_speak "):
+                        # DIAG-1: temporary diagnostic — speak arbitrary long text via production TTS path
+                        dtext = content[11:].strip()
+                        if dtext:
+                            print(f"[DIAG-1] speaking {len(dtext)} chars", flush=True)
+                            asyncio.create_task(speak(dtext))
                     elif content.startswith("@Echo") or content.startswith("@echo"):
                         ch = await get_text_channel()
                         if ch:
