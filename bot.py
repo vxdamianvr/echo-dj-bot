@@ -316,8 +316,9 @@ def get_stt_model():
     global stt_model
     if stt_model is None:
         print(f"[DEBUG] Loading WhisperModel '{WHISPER_MODEL}'...")
-        stt_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        print("[DEBUG] WhisperModel loaded.")
+        threads = min(8, max(2, (os.cpu_count() or 8) - 4))
+        stt_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=threads)
+        print(f"[DEBUG] WhisperModel loaded (cpu_threads={threads}).")
     return stt_model
 
 utterance_queue = asyncio.Queue()
@@ -2366,6 +2367,13 @@ class UserAudioBuffer:
                     self.vad_speech_start = time.time()
                 self.utterance_buffer.extend(frame)
                 self.silence_frames = 0
+                if len(self.utterance_buffer) >= 12 * 16000 * 2:
+                    self.is_speaking = False
+                    vad_endpoint = time.time()
+                    queue.put_nowait((self.user_id, bytes(self.utterance_buffer), self.audio_first_packet, self.vad_speech_start, vad_endpoint))
+                    self.utterance_buffer = bytearray()
+                    self.silence_frames = 0
+                    self.audio_first_packet = 0
             else:
                 if self.is_speaking:
                     self.utterance_buffer.extend(frame)
@@ -2381,10 +2389,21 @@ class UserAudioBuffer:
 def do_transcribe(audio_np):
     try:
         model = get_stt_model()
-        segments, info = model.transcribe(audio_np, beam_size=1, language=SPOKEN_LANGUAGE, initial_prompt="Echo")
+        segments, info = model.transcribe(
+            audio_np,
+            beam_size=1,
+            language=SPOKEN_LANGUAGE,
+            temperature=0.0,
+            max_new_tokens=96,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            without_timestamps=True
+        )
         text = " ".join(segment.text for segment in segments if segment.no_speech_prob < 0.5).strip()
         return text
-    except: return ""
+    except Exception as e:
+        print(f"[STT] do_transcribe error: {e}", flush=True)
+        return ""
 
 async def transcribe_worker():
     global last_speech_time
@@ -2408,8 +2427,16 @@ async def transcribe_worker():
                 print(f"[STT] Whisper timeout (10s) on {len(audio_bytes)/32000:.1f}s audio, dropping utterance", flush=True)
                 continue
             t_emit = time.time()
-            print(f"[DEBUG-LATENCY] {user_id} | endpoint -> emit: {t_emit - t_end:.2f}s (whisper: {t_emit - t_whisper0:.2f}s, qsize={utterance_queue.qsize()}, audio_s={len(audio_bytes)/32000:.1f})", flush=True)
-            
+            t_whisper = t_emit - t_whisper0
+            print(f"[DEBUG-LATENCY] {user_id} | endpoint -> emit: {t_emit - t_end:.2f}s (whisper: {t_whisper:.2f}s, qsize={utterance_queue.qsize()}, audio_s={len(audio_bytes)/32000:.1f})", flush=True)
+            if t_whisper > 5.0:
+                try:
+                    os.makedirs("logs/stt-debug", exist_ok=True)
+                    stt_fname = f"logs/stt-debug/{time.strftime('%H%M%S')}-{user_id}-{t_whisper:.1f}s.wav"
+                    sf.write(stt_fname, np.frombuffer(audio_bytes, dtype=np.int16), 16000, subtype="PCM_16")
+                    print(f"[STT-DEBUG] Saved slow utterance ({t_whisper:.2f}s) to {stt_fname}", flush=True)
+                except Exception as e:
+                    print(f"[STT-DEBUG] Failed to save debug wav: {e}", flush=True)
             if text:
                 last_speech_time = time.time()
                 user = bot.get_user(user_id)
