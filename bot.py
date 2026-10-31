@@ -2397,7 +2397,7 @@ async def transcribe_worker():
             t_whisper0 = time.time()
             text = await asyncio.to_thread(do_transcribe, audio_np)
             t_emit = time.time()
-            print(f"[DEBUG-LATENCY] {user_id} | endpoint -> emit: {t_emit - t_end:.2f}s (whisper: {t_emit - t_whisper0:.2f}s)", flush=True)
+            print(f"[DEBUG-LATENCY] {user_id} | endpoint -> emit: {t_emit - t_end:.2f}s (whisper: {t_emit - t_whisper0:.2f}s, qsize={utterance_queue.qsize()}, audio_s={len(audio_bytes)/32000:.1f})", flush=True)
             
             if text:
                 last_speech_time = time.time()
@@ -2892,10 +2892,10 @@ async def command_file_watcher():
                         url = content[16:].strip()
                         await handle_direct_playlist(url)
                     elif content.startswith("diag_speak "):
-                        # DIAG-1: temporary diagnostic — speak arbitrary long text via production TTS path
+                        # DIAG-V1: temporary diagnostic — speak via production TTS path
                         dtext = content[11:].strip()
                         if dtext:
-                            print(f"[DIAG-1] speaking {len(dtext)} chars", flush=True)
+                            print(f"[DIAG-V1] speaking {len(dtext)} chars", flush=True)
                             asyncio.create_task(speak(dtext))
                     elif content.startswith("@Echo") or content.startswith("@echo"):
                         ch = await get_text_channel()

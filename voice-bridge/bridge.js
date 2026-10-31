@@ -58,7 +58,7 @@ let isTtsPlaying = false;
 let duckingPause = false;
 let ttsDbg = {seq: null, tPlay: 0, expectedMs: 0};
 
-// DIAG-1: temporary event-loop lag monitor for long-cue investigation
+// DIAG-V1: temporary event-loop lag monitor
 let ttsDiagLagTimer = null;
 let ttsDiagMaxLag = 0;
 let ttsDiagLast = 0;
