@@ -66,10 +66,6 @@ ttsPlayer.on(AudioPlayerStatus.Idle, () => {
     const connection = getVoiceConnection(GUILD_ID);
     if (connection) {
         connection.subscribe(player);
-        if (duckingPause) {
-            duckingPause = false;
-            player.unpause();
-        }
     }
     if (ttsDbg.seq !== null && ttsDbg.seq !== undefined) {
         tcpClient.write(JSON.stringify({ event: 'tts_done', seq: ttsDbg.seq }) + '\n');
@@ -380,11 +376,6 @@ tcpClient.on('data', (chunk) => {
                 });
                 const { StreamType } = require('@discordjs/voice');
                 const resource = createAudioResource(readable, { inputType: StreamType.Raw });
-                
-                if (player.state.status === AudioPlayerStatus.Playing) {
-                    player.pause();
-                    duckingPause = true;
-                }
                 
                 isTtsPlaying = true;
                 const { getVoiceConnection } = require('@discordjs/voice');
