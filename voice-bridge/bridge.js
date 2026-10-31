@@ -71,6 +71,9 @@ ttsPlayer.on(AudioPlayerStatus.Idle, () => {
             player.unpause();
         }
     }
+    if (ttsDbg.seq !== null && ttsDbg.seq !== undefined) {
+        tcpClient.write(JSON.stringify({ event: 'tts_done', seq: ttsDbg.seq }) + '\n');
+    }
 });
 
 function prefetchNext() {

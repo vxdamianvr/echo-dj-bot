@@ -278,6 +278,9 @@ vibe_poll = {
 }
 TTS_DEBUG_WAV = True
 tts_dbg_seq = 0
+TTS_DONE_TIMEOUT_PAD = 10.0
+tts_cue_done = asyncio.Event()
+tts_cue_done.set()
 os.makedirs("logs/tts-debug", exist_ok=True)
 
 intents = discord.Intents.default()
@@ -504,6 +507,9 @@ async def _tts_worker():
                 seq = tts_dbg_seq
                 tts_dbg_seq += 1
 
+                duration = len(upsampled) / 48000.0
+                tts_cue_done.clear()
+
                 await send_bridge_cmd({
                     "cmd": "speak",
                     "pcm_b64": pcm_b64,
@@ -513,8 +519,10 @@ async def _tts_worker():
                 })
                 print(f"[TTS-DBG] seq={seq} cue='{text[:60]}' gen_ms={gen_ms:.0f} bytes={len(pcm_s16le)} file={fname}", flush=True)
 
-                duration = len(upsampled) / 48000.0
-                await asyncio.sleep(duration)
+                try:
+                    await asyncio.wait_for(tts_cue_done.wait(), timeout=duration + TTS_DONE_TIMEOUT_PAD)
+                except asyncio.TimeoutError:
+                    print(f"[TTS] WARNING: no tts_done for seq={seq} after {duration + TTS_DONE_TIMEOUT_PAD:.0f}s — continuing", flush=True)
             except Exception as e:
                 print("[CRITICAL] TTS failed:", e)
             finally:
@@ -2488,6 +2496,8 @@ async def handle_bridge_client(reader, writer):
                             print(f"[BRIDGE] Queue rejected track: {reason}", flush=True)
                         elif DEBUG:
                             print(f"[DEBUG] Bridge queue ack: ok", flush=True)
+                    elif evt == "tts_done":
+                        tts_cue_done.set()
                     continue
 
                 user_id = int(header["u"])
