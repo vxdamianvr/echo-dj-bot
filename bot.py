@@ -262,6 +262,19 @@ pick_gen = 0
 walk_in_flight = False
 now_playing_ref = {}
 last_announced = {}
+last_insert = {"query": None, "ts": 0.0}
+vibe_poll = {
+    "active": False,
+    "resolved": False,
+    "message": None,
+    "video_id": None,
+    "gen": None,
+    "index": None,
+    "timer_task": None,
+    "timeout_task": None,
+    "vibe_name": None,
+    "inserted_title": None
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -346,6 +359,7 @@ async def resume_walk_after_reconnect():
 
 async def reconnect_bridge_supervisor():
     global bridge_reconnecting, bridge_process, bridge_active, bridge_server
+    cancel_poll()
     if bridge_reconnecting or intentional_leave:
         return
     bridge_reconnecting = True
@@ -666,6 +680,50 @@ def score_song_match(query: str, candidate: dict | None) -> float:
 
 def is_strong_song_match(query: str, song: dict | None) -> bool:
     return score_song_match(query, song) == 1.0
+
+def parse_duration(duration_val) -> float | None:
+    if duration_val is None:
+        return None
+    if isinstance(duration_val, (int, float)):
+        return float(duration_val)
+    if isinstance(duration_val, str):
+        s = duration_val.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        parts = s.split(":")
+        if len(parts) == 2:
+            try:
+                m, sec = int(parts[0]), float(parts[1])
+                return m * 60 + sec
+            except ValueError:
+                return None
+        elif len(parts) == 3:
+            try:
+                h, m, sec = int(parts[0]), int(parts[1]), float(parts[2])
+                return h * 3600 + m * 60 + sec
+            except ValueError:
+                return None
+    return None
+
+POLL_CHANGE_RE = re.compile(r'\b(yes|yeah|yep|yup|change|switch|different|do it|mix it up)\b', re.IGNORECASE)
+POLL_KEEP_RE = re.compile(r'\b(no|nah|nope|keep|resume|stay|same)\b', re.IGNORECASE)
+
+def parse_poll_vote(text: str) -> str | None:
+    if not text or not re.search(r'\b(echo|ecko|eco)\b', text, re.IGNORECASE):
+        return None
+    change_matches = [m.start() for m in POLL_CHANGE_RE.finditer(text)]
+    keep_matches = [m.start() for m in POLL_KEEP_RE.finditer(text)]
+    if not change_matches and not keep_matches:
+        return None
+    if not keep_matches:
+        return "change"
+    if not change_matches:
+        return "keep"
+    return "change" if change_matches[-1] > keep_matches[-1] else "keep"
 
 async def search_single_song(query, source="ytmusic"):
     if source == "ytmusic":
@@ -1777,8 +1835,34 @@ def parse_voice_command(text):
     if re.search(r'^(play\s+(a\s+)?mix|radio|start\s+(a\s+)?radio|autoplay)\b', clean_norm, re.IGNORECASE):
         return {"action": "radio", "query": None, "source": None}
 
+    if re.match(r'^play\s*$', clean_norm, re.IGNORECASE):
+        return {"action": "resume", "query": None, "source": None}
+
+    insert_match = re.match(
+        r'^(queue|cue)\s+(.*)',
+        clean_norm,
+        re.IGNORECASE
+    )
+    if insert_match:
+        remainder = insert_match.group(2).strip()
+        query = re.sub(
+            r'^(some|me\s+some|a\s+bit\s+of|a\s+little(\s+bit\s+of)?|us\s+some)\s+',
+            '',
+            remainder,
+            flags=re.IGNORECASE
+        ).strip()
+        query = re.split(r'[.!?]+', query)[0].strip()
+        source = "ytmusic"
+        if re.search(r'\bon\s+soundcloud\b', query, re.IGNORECASE):
+            source = "soundcloud"
+            query = re.sub(r'\bon\s+soundcloud\b', '', query, flags=re.IGNORECASE).strip()
+        query = query.strip(" .,!?:;'\"")
+        if query:
+            return {"action": "insert", "query": query, "source": source}
+        return {"action": "unparseable", "query": None, "source": None}
+
     play_match = re.match(
-        r'^(play|put\s+on|throw\s+on|spin|drop|queue|start)\s+(.*)',
+        r'^(play|put\s+on|throw\s+on|spin|drop|start)\s+(.*)',
         clean_norm,
         re.IGNORECASE
     )
@@ -1851,6 +1935,241 @@ async def resolve_and_start_play(query, source, channel):
 
         asyncio.create_task(start_walk(query=query, source=source, gen_id=current_gen, pre_resolved_candidates=candidates))
 
+class VibePollView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Change it up", emoji="🌀", style=discord.ButtonStyle.primary, custom_id="vibe_poll_change")
+    async def change_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        asyncio.create_task(resolve_poll("change", via="button", interaction=interaction))
+
+    @discord.ui.button(label="Keep walking", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="vibe_poll_keep")
+    async def keep_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        asyncio.create_task(resolve_poll("keep", via="button", interaction=interaction))
+
+class VibePollDisabledView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="Change it up", emoji="🌀", style=discord.ButtonStyle.primary, disabled=True))
+        self.add_item(discord.ui.Button(label="Keep walking", emoji="🔁", style=discord.ButtonStyle.secondary, disabled=True))
+
+def cancel_poll():
+    global vibe_poll
+    for k in ("timer_task", "timeout_task"):
+        t = vibe_poll.get(k)
+        if t and not t.done():
+            t.cancel()
+    msg = vibe_poll.get("message")
+    if msg and not vibe_poll.get("resolved"):
+        async def _safe_del(m):
+            try:
+                await m.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_safe_del(msg))
+    vibe_poll.update(
+        active=False,
+        resolved=False,
+        message=None,
+        video_id=None,
+        gen=None,
+        index=None,
+        timer_task=None,
+        timeout_task=None,
+        vibe_name=None,
+        inserted_title=None
+    )
+
+async def _poll_timeout(seconds=60):
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        return
+    if vibe_poll.get("active") and not vibe_poll.get("resolved"):
+        msg = vibe_poll.get("message")
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        cancel_poll()
+
+async def _poll_halfway_timer(gen_id, index, video_id, delay):
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+
+    tracks = walk_state.get("tracks", [])
+    valid_index = 0 <= index < len(tracks)
+    if not (
+        pick_gen == gen_id
+        and walk_state.get("index") == index
+        and bridge_active
+        and valid_index
+        and tracks[index].get("inserted")
+        and vibe_poll.get("active")
+        and not vibe_poll.get("resolved")
+    ):
+        cancel_poll()
+        return
+
+    channel = await get_text_channel()
+    if not channel:
+        cancel_poll()
+        return
+
+    inserted_title = vibe_poll.get("inserted_title", "This track")
+    vibe_name = vibe_poll.get("vibe_name", "the walk")
+    question = f"🎵 {inserted_title} was a detour — change the vibe, or keep walking **{vibe_name}**?"
+    view = VibePollView()
+    try:
+        message = await channel.send(question, view=view)
+        vibe_poll["message"] = message
+    except Exception as e:
+        print(f"[POLL] Failed to send poll message: {e}", flush=True)
+        cancel_poll()
+        return
+
+    await speak(f"Quick poll: should I change the vibe, or keep walking {vibe_name}? Say 'echo yes' to change it, 'echo no' to keep it.")
+    vibe_poll["timeout_task"] = asyncio.create_task(_poll_timeout(60))
+
+async def schedule_vibe_poll(track, gen_id, index):
+    cancel_poll()
+    duration = parse_duration(track.get("duration")) or 60.0
+    vibe_name = f"the {walk_state['mix_seed']['title']} mix" if walk_state.get("mix_seed") else (walk_state.get("playlist_name") or "walk")
+    vibe_poll.update(
+        active=True,
+        resolved=False,
+        message=None,
+        video_id=track.get("video_id"),
+        gen=gen_id,
+        index=index,
+        inserted_title=track.get("title", "Track"),
+        vibe_name=vibe_name
+    )
+    delay = duration / 2.0
+    timer_task = asyncio.create_task(_poll_halfway_timer(gen_id, index, track.get("video_id"), delay))
+    vibe_poll["timer_task"] = timer_task
+
+async def start_vibe_change():
+    global walk_state, pick_gen
+    pick_gen += 1
+    new_gen = pick_gen
+    await send_bridge_cmd({"cmd": "clear_upcoming"})
+    cur_idx = walk_state.get("index", 0)
+    tracks = walk_state.get("tracks", [])
+    if tracks and 0 <= cur_idx < len(tracks):
+        cur = dict(tracks[cur_idx])
+    else:
+        cur = {"title": "Unknown", "artist": "Unknown", "url": "", "video_id": None}
+    cur.pop("inserted", None)
+    walk_state = {
+        "query": f"vibe change from {cur.get('title')}",
+        "source": "ytmusic",
+        "playlist_name": "YT Music mix",
+        "tracks": [cur],
+        "index": 0,
+        "tracks_played": 0,
+        "max_tracks": 50,
+        "single_song": None,
+        "mix_seed": cur,
+        "mix_fill_gen": None,
+        "explicit_playlist": None,
+        "started_ts": time.time()
+    }
+    await speak("Changing the vibe.")
+    ensure_mix_fill(new_gen)
+
+async def resolve_poll(vote: str, via: str, interaction=None):
+    if not vibe_poll.get("active") or vibe_poll.get("resolved"):
+        return
+    vibe_poll["resolved"] = True
+
+    for k in ("timer_task", "timeout_task"):
+        t = vibe_poll.get(k)
+        if t and not t.done():
+            t.cancel()
+
+    message = vibe_poll.get("message")
+    disabled_view = VibePollDisabledView()
+
+    if vote == "change":
+        if message:
+            try:
+                await message.edit(content="🌀 Changing the vibe…", view=disabled_view)
+            except Exception:
+                pass
+        await start_vibe_change()
+        if message:
+            async def _delete_later(msg):
+                await asyncio.sleep(30)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_delete_later(message))
+    else:  # "keep"
+        if message:
+            try:
+                await message.edit(content="🔁 Keeping the vibe.", view=disabled_view)
+            except Exception:
+                pass
+            async def _delete_later(msg):
+                await asyncio.sleep(30)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_delete_later(message))
+
+    vibe_poll.update(
+        active=False,
+        message=None,
+        video_id=None,
+        gen=None,
+        index=None,
+        timer_task=None,
+        timeout_task=None,
+        vibe_name=None,
+        inserted_title=None
+    )
+
+async def splice_insert(song_res, user_id=None, channel=None):
+    global walk_state
+    tracks = walk_state["tracks"]
+    cur_idx = walk_state.get("index", 0)
+    pos = cur_idx + 1
+    while pos < len(tracks) and tracks[pos].get("inserted"):
+        pos += 1
+    track = dict(song_res)
+    track["inserted"] = True
+    track["via"] = "Queued"
+    tracks.insert(pos, track)
+    walk_state["max_tracks"] = walk_state.get("max_tracks", 0) + 1
+
+    await send_bridge_cmd({
+        "cmd": "queue_next",
+        "url": track["url"],
+        "title": track["title"],
+        "artist": track.get("artist", ""),
+        "video_id": track.get("video_id")
+    })
+
+    title = track.get("title", "Track")
+    artist = track.get("artist", "Unknown")
+    await speak(f"Queued — {title} by {artist}. Up next.")
+    if channel:
+        await channel.send(f"👂 Queued — {title} by {artist}. Up next.")
+
 async def handle_voice_command(text, user_id):
     global current_persona, pick_gen, playback_intent
     
@@ -1862,6 +2181,7 @@ async def handle_voice_command(text, user_id):
     channel = bot.get_channel(TEXT_CHANNEL_ID)
     
     if action == "skip":
+        cancel_poll()
         playback_intent = "playing"
         await send_bridge_cmd({"cmd": "skip"})
         if walk_state.get("mix_seed") and len(walk_state.get("tracks", [])) <= 1:
@@ -1888,6 +2208,7 @@ async def handle_voice_command(text, user_id):
         return
 
     if action == "stop":
+        cancel_poll()
         playback_intent = "stopped"
         await send_bridge_cmd({"cmd": "stop"})
         asyncio.create_task(speak("Stopped."))
@@ -1912,6 +2233,30 @@ async def handle_voice_command(text, user_id):
         asyncio.create_task(speak("Radio mode on."))
         if channel: await channel.send("📻 Rolling the radio mix...")
         asyncio.create_task(re_roll_walk(gen_id=pick_gen))
+        return
+
+    if action == "insert":
+        norm_query = re.sub(r"\s+", " ", query.strip().lower())
+        now = time.time()
+        if norm_query and norm_query == last_insert.get("query") and (now - last_insert.get("ts", 0.0)) < 30:
+            await speak("Already on it.")
+            return
+        last_insert["query"] = norm_query
+        last_insert["ts"] = now
+
+        song_res = await search_single_song(query, source=source)
+        if not song_res or not is_strong_song_match(query, song_res):
+            await speak(f"Couldn't find {query}.")
+            if channel:
+                await channel.send(f"❌ Couldn't find {query}.")
+            return
+
+        if not bridge_active or not walk_state.get("tracks"):
+            playback_intent = "playing"
+            await resolve_and_start_play(query, source, channel)
+            return
+
+        await splice_insert(song_res, user_id=user_id, channel=channel)
         return
 
     if action == "play":
@@ -2000,7 +2345,13 @@ async def transcribe_worker():
                     transcript_history.pop(0)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {name}: {text}", flush=True)
                 
-                if re.search(r'\b(echo|ecko|eco)\b', text, re.IGNORECASE):
+                if vibe_poll.get("active") and vibe_poll.get("message") and not vibe_poll.get("resolved"):
+                    vote = parse_poll_vote(text)
+                    if vote:
+                        asyncio.create_task(resolve_poll(vote, via="voice"))
+                    elif re.search(r'\b(echo|ecko|eco)\b', text, re.IGNORECASE):
+                        asyncio.create_task(handle_voice_command(text, user_id))
+                elif re.search(r'\b(echo|ecko|eco)\b', text, re.IGNORECASE):
                     asyncio.create_task(handle_voice_command(text, user_id))
         except Exception as e:
             print("[CRITICAL] transcribe_worker error:")
@@ -2051,6 +2402,15 @@ async def handle_bridge_client(reader, writer):
 
                         walk_state["tracks_played"] = walk_state.get("tracks_played", 0) + 1
                         
+                        cur_idx = walk_state.get("index", 0)
+                        if vibe_poll.get("active"):
+                            if vid and vid != vibe_poll.get("video_id"):
+                                cancel_poll()
+                        if tracks and 0 <= cur_idx < len(tracks):
+                            cur_track = tracks[cur_idx]
+                            if cur_track.get("inserted"):
+                                asyncio.create_task(schedule_vibe_poll(cur_track, pick_gen, cur_idx))
+
                         log_play_history(title, artist, url, vid, walk_state.get("playlist_name", ""))
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] ▶️ Now playing: {title} — {artist} ({vid or 'no-id'})", flush=True)
                         key = (vid, pick_gen, walk_state.get("index", 0))
@@ -2213,6 +2573,7 @@ async def leave(ctx=None):
     global bridge_process, bridge_server, bridge_active, intentional_leave, playback_intent
     if ctx:
         await ctx.defer()
+    cancel_poll()
     intentional_leave = True
     playback_intent = "stopped"
     await send_bridge_cmd({"cmd": "stop"})
@@ -2230,6 +2591,7 @@ async def leave(ctx=None):
 async def skip(ctx):
     global playback_intent
     await ctx.defer()
+    cancel_poll()
     playback_intent = "playing"
     await send_bridge_cmd({"cmd": "skip"})
     if walk_state.get("mix_seed") and len(walk_state.get("tracks", [])) <= 1:
@@ -2259,6 +2621,7 @@ async def resume(ctx):
 async def stop(ctx):
     global playback_intent
     await ctx.defer()
+    cancel_poll()
     playback_intent = "stopped"
     await send_bridge_cmd({"cmd": "stop"})
     await ctx.followup.send("Playback stopped ⏹️")
@@ -2402,7 +2765,7 @@ async def on_message(message):
             return
 
         if not bridge_active:
-            if action in ("play", "radio"):
+            if action in ("play", "radio", "insert"):
                 await message.channel.send("Joining voice… 🎧")
                 ok = await ensure_voice_joined()
                 if not ok:
@@ -2478,7 +2841,14 @@ async def command_file_watcher():
                             sim_msg = SimMessage(ch, sub_text)
                             await on_message(sim_msg)
                     elif content.startswith("Echo") or content.startswith("echo") or content.startswith("hey echo"):
-                        await handle_voice_command(content, 0)
+                        if vibe_poll.get("active") and vibe_poll.get("message") and not vibe_poll.get("resolved"):
+                            vote = parse_poll_vote(content)
+                            if vote:
+                                asyncio.create_task(resolve_poll(vote, via="voice"))
+                            else:
+                                await handle_voice_command(content, 0)
+                        else:
+                            await handle_voice_command(content, 0)
         except Exception as e:
             if DEBUG: print(f"[DEBUG] command_file_watcher error: {e}", flush=True)
         await asyncio.sleep(0.5)
@@ -2488,6 +2858,7 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     
     bot.add_view(PersonaView())
+    bot.add_view(VibePollView())
     print("[DEBUG] Warming up Ollama...")
     bot.loop.create_task(warmup_ollama())
     get_stt_model()

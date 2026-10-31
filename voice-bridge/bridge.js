@@ -290,6 +290,36 @@ tcpClient.on('data', (chunk) => {
                 } else {
                     prefetchNext(); // trigger prefetch if player is busy
                 }
+            } else if (msg.cmd === 'queue_next') {
+                if (!msg.url || typeof msg.url !== 'string' || !msg.url.trim()) {
+                    if (DEBUG) console.log(`[DEBUG] Rejecting queue_next cmd: missing or invalid url`);
+                    if (msg.uuid) {
+                        tcpClient.write(JSON.stringify({ event: 'queue_ack', status: 'rejected', reason: 'invalid_url', uuid: msg.uuid }) + '\n');
+                    }
+                    continue;
+                }
+                
+                if (DEBUG) console.log(`[DEBUG] Received queue_next cmd: ${msg.title}`);
+                let insertIdx = 0;
+                while (insertIdx < audioQueue.length && audioQueue[insertIdx].inserted) {
+                    insertIdx++;
+                }
+                audioQueue.splice(insertIdx, 0, { url: msg.url, title: msg.title, artist: msg.artist, video_id: msg.video_id || null, inserted: true });
+                if (msg.uuid) {
+                    tcpClient.write(JSON.stringify({ event: 'queue_ack', status: 'ok', uuid: msg.uuid }) + '\n');
+                }
+                
+                if (player.state.status === AudioPlayerStatus.Idle) {
+                    playNext(0);
+                } else {
+                    prefetchNext();
+                }
+            } else if (msg.cmd === 'clear_upcoming') {
+                if (DEBUG) console.log('[DEBUG] Received clear_upcoming cmd');
+                audioQueue = [];
+                if (msg.uuid) {
+                    tcpClient.write(JSON.stringify({ event: 'clear_upcoming_ack', status: 'ok', uuid: msg.uuid }) + '\n');
+                }
             } else if (msg.cmd === 'skip') {
                 if (DEBUG) console.log('[DEBUG] Received skip cmd');
                 isCommandTransition = true;
