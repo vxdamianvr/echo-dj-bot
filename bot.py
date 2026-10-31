@@ -254,10 +254,14 @@ walk_state = {
     "tracks_played": 0,
     "max_tracks": 12,
     "single_song": None,
-    "explicit_playlist": None
+    "mix_seed": None,
+    "explicit_playlist": None,
+    "mix_fill_gen": None
 }
 pick_gen = 0
 walk_in_flight = False
+now_playing_ref = {}
+last_announced = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -643,19 +647,66 @@ async def resolve_playlist_soundcloud(query):
     candidates.sort(key=lambda x: x["track_count"], reverse=True)
     return candidates
 
+STOPWORDS = {"the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "from", "and", "or"}
+
+def extract_significant_words(text: str) -> list[str]:
+    if not text:
+        return []
+    return [w for w in re.findall(r'[a-zA-Z0-9]+', text.lower()) if w not in STOPWORDS]
+
+def score_song_match(query: str, candidate: dict | None) -> float:
+    if not candidate or not query:
+        return 0.0
+    words = extract_significant_words(query)
+    if len(words) < 2:
+        return 0.0
+    target = f"{candidate.get('title', '')} {candidate.get('artist', '')}".lower()
+    matches = sum(1 for w in words if w in target)
+    return matches / len(words)
+
+def is_strong_song_match(query: str, song: dict | None) -> bool:
+    return score_song_match(query, song) == 1.0
+
 async def search_single_song(query, source="ytmusic"):
     if source == "ytmusic":
         try:
-            res = await asyncio.to_thread(yt.search, query, filter="songs", limit=1)
-            if res:
-                s = res[0]
+            s_task = asyncio.to_thread(yt.search, query, filter="songs", limit=5)
+            v_task = asyncio.to_thread(yt.search, query, filter="videos", limit=5)
+            results = await asyncio.gather(s_task, v_task, return_exceptions=True)
+
+            candidates = []
+            s_res = results[0] if isinstance(results[0], list) else []
+            v_res = results[1] if isinstance(results[1], list) else []
+
+            for s in s_res:
                 vid = s.get("videoId")
+                if not vid: continue
                 title = s.get("title", "Unknown")
                 artists_list = s.get("artists", [])
                 artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
                 url = f"https://youtube.com/watch?v={vid}"
-                return {"title": title, "artist": artist, "video_id": vid, "url": url, "duration": s.get("duration")}
-        except: pass
+                candidates.append({
+                    "title": title, "artist": artist, "video_id": vid, "url": url,
+                    "duration": s.get("duration"), "resultType": "song"
+                })
+
+            for v in v_res:
+                vid = v.get("videoId")
+                if not vid: continue
+                title = v.get("title", "Unknown")
+                artists_list = v.get("artists", [])
+                artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
+                url = f"https://youtube.com/watch?v={vid}"
+                candidates.append({
+                    "title": title, "artist": artist, "video_id": vid, "url": url,
+                    "duration": v.get("duration"), "resultType": "video"
+                })
+
+            if candidates:
+                best = max(candidates, key=lambda c: (score_song_match(query, c), 1 if c.get("resultType") == "song" else 0))
+                return best
+        except Exception:
+            pass
     try:
         cmd = ["yt-dlp", "--no-playlist", "--match-filter", "duration <= 600", "--print", "%(id)s|%(title)s|%(uploader)s|%(duration)s", f"ytsearch1:{query}"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -668,8 +719,9 @@ async def search_single_song(query, source="ytmusic"):
             artist = parts[2] if len(parts) > 2 else "Unknown"
             dur = parts[3] if len(parts) > 3 else "180"
             url = f"https://youtube.com/watch?v={vid}"
-            return {"title": title, "artist": artist, "video_id": vid, "url": url, "duration": dur}
-    except: pass
+            return {"title": title, "artist": artist, "video_id": vid, "url": url, "duration": dur, "resultType": "video"}
+    except Exception:
+        pass
     return None
 
 async def fetch_playlist_tracks(playlist_id):
@@ -930,39 +982,86 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
                     
             # 5c. If fewer than 3 usable playlists: fall back to SONG search
             if not tracks or len(candidates) < 3:
+                _ct = walk_state.get("tracks", [])
+                _ci = walk_state.get("index", 0)
+                cur_vid = _ct[_ci].get("video_id") if _ct and 0 <= _ci < len(_ct) else None
+
                 song = await search_single_song(query, source=source)
-                if song:
-                    if pick_gen != gen_id: return
-                    walk_state = {
-                        "query": query,
-                        "source": source,
-                        "playlist_name": "Direct Search",
-                        "tracks": [song],
-                        "index": 0,
-                        "tracks_played": 1,
-                        "max_tracks": 1,
-                        "single_song": song,
-                        "mix_seed": None,
-                        "explicit_playlist": None,
-                        "started_ts": time.time()
-                    }
-                    if interrupt:
-                        await send_bridge_cmd({"cmd": "stop"})
-                    await send_bridge_cmd({
-                        "cmd": "queue",
-                        "url": song["url"],
-                        "title": song["title"],
-                        "artist": song["artist"],
-                        "video_id": song.get("video_id")
-                    })
-                    log_pick("echo", query, source, "Direct Search", song["title"], song["artist"], song.get("video_id"))
-                    return
-                else:
-                    # 5d. Song search also fails: TTS "couldn't find <query>" and keep current walk
+                if not song or not is_strong_song_match(query, song):
                     await speak(f"Couldn't find {query}.")
-                    channel = bot.get_channel(TEXT_CHANNEL_ID)
+                    channel = await get_text_channel()
                     if channel: await channel.send(f"❌ Couldn't find {query}.")
                     return
+
+                if pick_gen != gen_id: return
+
+                if not interrupt and cur_vid and song.get("video_id") == cur_vid:
+                    print(f"[WALK] Direct Search match is currently playing; using curated playlist instead", flush=True)
+                    pid, name = get_curated_playlist()
+                    curated_tracks = []
+                    c_title = ""
+                    if pid:
+                        try:
+                            c_title, curated_tracks = await fetch_playlist_tracks(pid)
+                        except Exception:
+                            curated_tracks = []
+                    if curated_tracks:
+                        offset = random.randint(1, len(curated_tracks) - 1) if len(curated_tracks) > 1 else 0
+                        walk_state = {
+                            "query": query,
+                            "source": source,
+                            "playlist_name": c_title or name,
+                            "tracks": curated_tracks,
+                            "index": offset,
+                            "tracks_played": 0,
+                            "max_tracks": random.randint(10, 15),
+                            "single_song": None,
+                            "mix_seed": None,
+                            "explicit_playlist": None,
+                            "started_ts": time.time(),
+                            "mix_fill_gen": None
+                        }
+                        track = curated_tracks[offset]
+                        await send_bridge_cmd({
+                            "cmd": "queue",
+                            "url": track["url"],
+                            "title": track["title"],
+                            "artist": track["artist"],
+                            "video_id": track.get("video_id")
+                        })
+                        log_pick("curated-fallback", query, source, walk_state["playlist_name"], track["title"], track["artist"], track.get("video_id"))
+                        return
+                    else:
+                        await speak(f"Couldn't find {query}.")
+                        channel = await get_text_channel()
+                        if channel: await channel.send(f"❌ Couldn't find {query}.")
+                        return
+
+                walk_state = {
+                    "query": query,
+                    "source": source,
+                    "playlist_name": "Direct Search",
+                    "tracks": [song],
+                    "index": 0,
+                    "tracks_played": 1,
+                    "max_tracks": 1,
+                    "single_song": song,
+                    "mix_seed": None,
+                    "explicit_playlist": None,
+                    "started_ts": time.time(),
+                    "mix_fill_gen": None
+                }
+                if interrupt:
+                    await send_bridge_cmd({"cmd": "stop"})
+                await send_bridge_cmd({
+                    "cmd": "queue",
+                    "url": song["url"],
+                    "title": song["title"],
+                    "artist": song["artist"],
+                    "video_id": song.get("video_id")
+                })
+                log_pick("echo", query, source, "Direct Search", song["title"], song["artist"], song.get("video_id"))
+                return
 
         # 6a. Start at a RANDOM offset (never track 1 when tracks > 1, unless explicit with initial_start_index)
         if explicit_playlist and initial_start_index is not None and 0 <= initial_start_index < len(tracks):
@@ -985,7 +1084,8 @@ async def start_walk(query="", source="ytmusic", gen_id=0, explicit_playlist=Non
             "single_song": None,
             "mix_seed": None,
             "explicit_playlist": explicit_playlist,
-            "started_ts": time.time()
+            "started_ts": time.time(),
+            "mix_fill_gen": None
         }
         
         # 6c. DEDUP: check video ID against recent_played_vids
@@ -1057,6 +1157,10 @@ async def advance_walk(trigger="keep_ahead", gen_id=0):
             break
             
     if not track:
+        if walk_state.get("mix_seed") and start_idx == walk_state.get("index", 0):
+            print(f"[WALK] advance: seed playing, mix pending — waiting for mix fill", flush=True)
+            ensure_mix_fill(gen_id)
+            return
         track = tracks[start_idx]
         chosen_idx = start_idx
 
@@ -1072,16 +1176,16 @@ async def advance_walk(trigger="keep_ahead", gen_id=0):
     })
     log_pick(trigger, walk_state.get("query", ""), walk_state.get("source", "ytmusic"), walk_state.get("playlist_name", ""), track["title"], track["artist"], track.get("video_id"))
 
-STOPWORDS = {"the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "from", "and", "or"}
-
-def is_strong_song_match(query: str, song: dict | None) -> bool:
-    if not song or not query:
-        return False
-    words = [w for w in re.findall(r'[a-zA-Z0-9]+', query.lower()) if w not in STOPWORDS]
-    if len(words) < 2:
-        return False
-    target = f"{song.get('title', '')} {song.get('artist', '')}".lower()
-    return all(w in target for w in words)
+def ensure_mix_fill(gen_id):
+    if not walk_state.get("mix_seed"):
+        return asyncio.sleep(0)
+    if walk_state.get("mix_fill_gen") == gen_id:
+        t = walk_state.get("mix_fill_task")
+        return t if t else asyncio.sleep(0)
+    walk_state["mix_fill_gen"] = gen_id
+    t = asyncio.create_task(fill_mix_queue(walk_state["mix_seed"], gen_id))
+    walk_state["mix_fill_task"] = t
+    return t
 
 async def start_song_route(song_res, query, source, gen_id):
     global walk_state, pick_gen, walk_in_flight
@@ -1102,12 +1206,13 @@ async def start_song_route(song_res, query, source, gen_id):
     walk_in_flight = True
     try:
         song_track = dict(song_res)
-        song_track["via"] = "YT Music mix"
+        song_track["resultType"] = song_res.get("resultType", "song")
+        song_track["via"] = "YouTube" if song_track.get("resultType") == "video" else "YT Music mix"
 
         walk_state = {
             "query": query,
             "source": source,
-            "playlist_name": "YT Music mix",
+            "playlist_name": song_track["via"],
             "tracks": [song_track],
             "index": 0,
             "tracks_played": 0,
@@ -1115,7 +1220,8 @@ async def start_song_route(song_res, query, source, gen_id):
             "single_song": song_track,
             "mix_seed": song_track,
             "explicit_playlist": None,
-            "started_ts": time.time()
+            "started_ts": time.time(),
+            "mix_fill_gen": None
         }
 
         await send_bridge_cmd({"cmd": "stop"})
@@ -1126,68 +1232,156 @@ async def start_song_route(song_res, query, source, gen_id):
             "artist": song_track["artist"],
             "video_id": song_track.get("video_id")
         })
-        log_pick("echo", query, source, "YT Music mix", song_track["title"], song_track["artist"], song_track.get("video_id"))
+        log_pick("echo", query, source, song_track["via"], song_track["title"], song_track["artist"], song_track.get("video_id"))
     finally:
         walk_in_flight = False
 
 async def fill_mix_queue(seed_track, gen_id):
-    global walk_state, pick_gen
+    global walk_state, pick_gen, now_playing_ref
     seed_vid = seed_track.get("video_id")
     if not seed_vid:
         print("[MIX] Seed track has no video_id, cannot fetch mix", flush=True)
         return
 
-    print(f"[MIX] Fetching watch playlist mix for seed: {seed_track.get('title')} ({seed_vid})", flush=True)
+    seed_result_type = seed_track.get("resultType", "song")
+    title = seed_track.get("title", "")
+    artist = seed_track.get("artist", "")
+
+    def _filter_usable(raw_tracks, s_vid):
+        surviving_list = []
+        seen = {s_vid}
+        for t in raw_tracks:
+            vid = t.get("videoId")
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            if vid in recent_played_vids:
+                continue
+            t_title = t.get("title", "Unknown")
+            artists_list = t.get("artists", [])
+            t_artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
+            surviving_list.append({
+                "title": t_title,
+                "artist": t_artist,
+                "video_id": vid,
+                "url": f"https://youtube.com/watch?v={vid}",
+                "duration": t.get("length") or t.get("duration"),
+                "via": "YT Music mix"
+            })
+        return surviving_list
+
+    usable = []
+    # 1. Direct watch playlist on seed videoId
+    print(f"[MIX] Fetching watch playlist mix for seed: {title} ({seed_vid})", flush=True)
     try:
-        res = await asyncio.to_thread(yt.get_watch_playlist, videoId=seed_vid, radio=True, limit=25)
+        res = await asyncio.wait_for(asyncio.to_thread(yt.get_watch_playlist, videoId=seed_vid, radio=True, limit=25), timeout=15)
+        raw = res.get("tracks", []) if res else []
+        usable = _filter_usable(raw, seed_vid)
+        print(f"[MIX] Attempt 1 (direct seed): {len(raw)} tracks fetched, {len(usable)} usable", flush=True)
     except Exception as e:
-        print(f"[MIX] Error fetching watch playlist: {e}", flush=True)
-        res = None
+        print(f"[MIX] Attempt 1 (direct seed) failed: {e}", flush=True)
 
-    if pick_gen != gen_id or not bridge_active:
-        print(f"[MIX] Generation changed ({pick_gen} != {gen_id}) or bridge inactive, discarding mix", flush=True)
-        return
+    # 2. If len(usable) < 3 and seed resultType == "video" -> retry via song-type match
+    if len(usable) < 3 and seed_result_type == "video":
+        try:
+            sc = await asyncio.wait_for(asyncio.to_thread(yt.search, f"{title} {artist}", filter="songs", limit=5), timeout=15)
+            song_candidates = []
+            for s in (sc or []):
+                vid = s.get("videoId")
+                if not vid: continue
+                s_title = s.get("title", "Unknown")
+                artists_list = s.get("artists", [])
+                s_artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
+                song_candidates.append({
+                    "title": s_title, "artist": s_artist, "video_id": vid, "resultType": "song"
+                })
+            if song_candidates:
+                best = max(song_candidates, key=lambda c: (score_song_match(f"{title} {artist}", c), 1))
+                if best and is_strong_song_match(f"{title} {artist}", best):
+                    best_vid = best.get("video_id")
+                    print(f"[MIX] video seed: retrying via song-type match {best_vid}", flush=True)
+                    res2 = await asyncio.wait_for(asyncio.to_thread(yt.get_watch_playlist, videoId=best_vid, radio=True, limit=25), timeout=15)
+                    raw2 = res2.get("tracks", []) if res2 else []
+                    usable = _filter_usable(raw2, seed_vid)
+                    print(f"[MIX] Attempt 2 (song-type match): {len(raw2)} fetched, {len(usable)} usable", flush=True)
+                else:
+                    print(f"[MIX] Attempt 2: best song candidate did not match strongly", flush=True)
+            else:
+                print(f"[MIX] Attempt 2: no song candidates found", flush=True)
+        except Exception as e:
+            print(f"[MIX] Attempt 2 (song-type match) failed: {e}", flush=True)
 
-    raw_tracks = res.get("tracks", []) if res else []
-    surviving = []
-    seen_vids = {seed_vid}
+    # 3. If still < 3 and seed resultType == "video" -> retry via artist top track
+    if len(usable) < 3 and seed_result_type == "video":
+        try:
+            ar = await asyncio.wait_for(asyncio.to_thread(yt.search, artist, filter="artists", limit=1), timeout=15)
+            artist_id = None
+            if ar and isinstance(ar, list) and len(ar) > 0:
+                artist_id = ar[0].get("browseId") or ar[0].get("id")
+            if artist_id:
+                ad = await asyncio.wait_for(asyncio.to_thread(yt.get_artist, artist_id), timeout=15)
+                songs_sec = ad.get("songs", {}).get("results", [])
+                if songs_sec:
+                    top = songs_sec[0]
+                    top_vid = top.get("videoId")
+                    if top_vid:
+                        print(f"[MIX] video seed: retrying via artist top track {top_vid}", flush=True)
+                        res3 = await asyncio.wait_for(asyncio.to_thread(yt.get_watch_playlist, videoId=top_vid, radio=True, limit=25), timeout=15)
+                        raw3 = res3.get("tracks", []) if res3 else []
+                        usable = _filter_usable(raw3, seed_vid)
+                        print(f"[MIX] Attempt 3 (artist top track): {len(raw3)} fetched, {len(usable)} usable", flush=True)
+                    else:
+                        print(f"[MIX] Attempt 3: top artist song has no videoId", flush=True)
+                else:
+                    print(f"[MIX] Attempt 3: artist has no songs section", flush=True)
+            else:
+                print(f"[MIX] Attempt 3: artist not found", flush=True)
+        except Exception as e:
+            print(f"[MIX] artist fallback failed: {e}", flush=True)
 
-    for t in raw_tracks:
-        vid = t.get("videoId")
-        if not vid or vid in seen_vids:
-            continue
-        seen_vids.add(vid)
-        if vid in recent_played_vids:
-            continue
-
-        title = t.get("title", "Unknown")
-        artists_list = t.get("artists", [])
-        artist = ", ".join(a["name"] for a in artists_list if isinstance(a, dict) and "name" in a) if artists_list else "Unknown"
-        surviving.append({
-            "title": title,
-            "artist": artist,
-            "video_id": vid,
-            "url": f"https://youtube.com/watch?v={vid}",
-            "duration": t.get("length") or t.get("duration"),
-            "via": "YT Music mix"
-        })
-
-    print(f"[MIX] Fetched {len(raw_tracks)} tracks, {len(surviving)} usable after filtering for seed {seed_vid}", flush=True)
-
-    if len(surviving) < 3:
-        print(f"[MIX] Usable tracks < 3 ({len(surviving)}), falling back to re-roll walk", flush=True)
+    # 4. Usable < 3 check and fallback
+    if len(usable) < 3:
+        print(f"[MIX] Usable tracks < 3 ({len(usable)}), falling back to re-roll walk", flush=True)
         if pick_gen == gen_id and bridge_active:
             walk_state["mix_seed"] = None
             await re_roll_walk(gen_id=gen_id)
         return
 
+    # Generation checkpoint before append
     if pick_gen != gen_id or not bridge_active:
         print(f"[MIX] Generation changed ({pick_gen} != {gen_id}) before append, discarding mix", flush=True)
         return
 
-    walk_state["tracks"].extend(surviving)
+    walk_state["tracks"].extend(usable)
     walk_state["max_tracks"] = len(walk_state["tracks"])
-    print(f"[MIX] Successfully appended {len(surviving)} mix tracks to queue (total: {len(walk_state['tracks'])})", flush=True)
+    print(f"[MIX] Successfully appended {len(usable)} mix tracks to queue (total: {len(walk_state['tracks'])})", flush=True)
+
+    # A5: Now-playing mix update
+    if now_playing_ref.get("video_id") == seed_vid and now_playing_ref.get("gen") == gen_id and now_playing_ref.get("message") is not None:
+        try:
+            msg = now_playing_ref["message"]
+            tracks = walk_state.get("tracks", [])
+            seed_via = seed_track.get("via", "YT Music mix")
+            song_url = seed_track.get("url") or f"https://youtube.com/watch?v={seed_vid}"
+            new_desc = f'Now playing: [{title} — {artist}]({song_url})\nvia "{seed_via}" · track 1/{len(tracks)}'
+            vibe_line = f'\n🎶 Okay, continuing with this vibe — {len(usable)} more queued.'
+            if "🎶 Okay, continuing with this vibe" not in new_desc:
+                new_desc += vibe_line
+            new_embed = discord.Embed(color=discord.Color.blurple())
+            new_embed.description = new_desc
+            if getattr(msg, "embeds", None) and len(msg.embeds) > 0:
+                old_embed = msg.embeds[0]
+                if getattr(old_embed, "thumbnail", None) and old_embed.thumbnail.url:
+                    new_embed.set_thumbnail(url=old_embed.thumbnail.url)
+                elif getattr(old_embed, "image", None) and old_embed.image.url:
+                    new_embed.set_image(url=old_embed.image.url)
+                elif seed_vid:
+                    new_embed.set_image(url=f"https://i.ytimg.com/vi/{seed_vid}/hqdefault.jpg")
+            elif seed_vid:
+                new_embed.set_image(url=f"https://i.ytimg.com/vi/{seed_vid}/hqdefault.jpg")
+            await msg.edit(embed=new_embed)
+        except Exception as e:
+            print(f"[MIX] Failed to update now-playing embed: {e}", flush=True)
 
     await check_and_queue_ahead(gen_id)
 
@@ -1199,7 +1393,7 @@ async def refill_mix_queue(mix_seed, gen_id):
 
     print(f"[MIX] Mix queue exhausted, re-seeding fresh mix from original track: {mix_seed.get('title')} ({seed_vid})", flush=True)
     try:
-        res = await asyncio.to_thread(yt.get_watch_playlist, videoId=seed_vid, radio=True, limit=25)
+        res = await asyncio.wait_for(asyncio.to_thread(yt.get_watch_playlist, videoId=seed_vid, radio=True, limit=25), timeout=15)
     except Exception as e:
         print(f"[MIX] Error re-seeding mix: {e}", flush=True)
         res = None
@@ -1296,7 +1490,8 @@ async def re_roll_walk(gen_id=0):
                     "max_tracks": random.randint(10, 15),
                     "single_song": None,
                     "explicit_playlist": None,
-                    "started_ts": time.time()
+                    "started_ts": time.time(),
+                    "mix_fill_gen": None
                 }
                 track = tracks[offset]
                 await send_bridge_cmd({
@@ -1388,15 +1583,20 @@ async def _finalize_now_playing(message, thread, title, artist, playlist_name, v
         print(f"[SENTIMENT] [{title}] sentiment generation failed: {e}", flush=True)
         traceback.print_exc()
 
-    # 3. Build embed WITHOUT the one-liner (description = base_desc; large image preserved)
-    if base_desc is None and getattr(message, "embeds", None):
-        base_desc = message.embeds[0].description or ""
+    # 3. Build embed WITHOUT the one-liner (description = live description fallback to base_desc; large image preserved)
+    live_desc = None
+    try:
+        if getattr(message, "embeds", None) and len(message.embeds) > 0 and message.embeds[0].description:
+            live_desc = message.embeds[0].description
+    except Exception:
+        pass
+    working_desc = live_desc if live_desc is not None else (base_desc or "")
 
     embed = discord.Embed(color=discord.Color.blurple())
-    embed.description = base_desc
+    embed.description = working_desc
     if video_id:
         embed.set_image(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
-    elif getattr(message, "embeds", None) and message.embeds[0].image and message.embeds[0].image.url:
+    elif getattr(message, "embeds", None) and len(message.embeds) > 0 and message.embeds[0].image and message.embeds[0].image.url:
         embed.set_image(url=message.embeds[0].image.url)
 
     # 4. First edit: emoji-led content, embed=embed
@@ -1497,6 +1697,9 @@ async def announce_track_start(title, artist, url, video_id):
             message = await channel.send(embed=embed)
         except Exception as e:
             if DEBUG: print(f"[DEBUG] now-playing embed send failed: {e}", flush=True)
+    
+    global now_playing_ref
+    now_playing_ref = {"message": message, "video_id": video_id, "gen": pick_gen}
     
     if message:
         thread = None
@@ -1634,7 +1837,9 @@ async def resolve_and_start_play(query, source, channel):
             await channel.send(f"👂 {ack_msg}")
 
         await start_song_route(song_res, query=query, source=source, gen_id=current_gen)
-        asyncio.create_task(fill_mix_queue(song_res, gen_id=current_gen))
+        if not walk_state.get("mix_seed"):
+            walk_state["mix_seed"] = song_res
+        ensure_mix_fill(current_gen)
     else:
         pick_gen += 1
         current_gen = pick_gen
@@ -1659,6 +1864,8 @@ async def handle_voice_command(text, user_id):
     if action == "skip":
         playback_intent = "playing"
         await send_bridge_cmd({"cmd": "skip"})
+        if walk_state.get("mix_seed") and len(walk_state.get("tracks", [])) <= 1:
+            await ensure_mix_fill(pick_gen)
         asyncio.create_task(speak("Skipping."))
         if channel: await channel.send("⏭️ Skipping track.")
         return
@@ -1846,7 +2053,13 @@ async def handle_bridge_client(reader, writer):
                         
                         log_play_history(title, artist, url, vid, walk_state.get("playlist_name", ""))
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] ▶️ Now playing: {title} — {artist} ({vid or 'no-id'})", flush=True)
-                        asyncio.create_task(announce_track_start(title, artist, url, vid))
+                        key = (vid, pick_gen, walk_state.get("index", 0))
+                        if last_announced.get("key") == key and time.time() - last_announced.get("ts", 0) < 10:
+                            if DEBUG: print(f"[DEBUG] Skipping duplicate announce_track_start for key {key}", flush=True)
+                        else:
+                            last_announced["key"] = key
+                            last_announced["ts"] = time.time()
+                            asyncio.create_task(announce_track_start(title, artist, url, vid))
                         asyncio.create_task(check_and_queue_ahead(pick_gen))
                     elif evt == "queue_empty":
                         player_state = header.get("player", "idle")
@@ -2019,6 +2232,8 @@ async def skip(ctx):
     await ctx.defer()
     playback_intent = "playing"
     await send_bridge_cmd({"cmd": "skip"})
+    if walk_state.get("mix_seed") and len(walk_state.get("tracks", [])) <= 1:
+        await ensure_mix_fill(pick_gen)
     await ctx.followup.send("Skipped current track ⏭️")
 
 @bot.slash_command(name="back", description="Play previous track")
